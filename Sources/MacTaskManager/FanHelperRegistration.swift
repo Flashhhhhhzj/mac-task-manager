@@ -9,11 +9,14 @@ enum FanHelperRegistration {
     private static let onboardingDismissedBuildKey = "FanHelperOnboardingDismissedBuild"
 
     enum RegistrationError: LocalizedError {
+        case appBundleRequired
         case unregisterTimedOut
         case registrationDenied(String)
 
         var errorDescription: String? {
             switch self {
+            case .appBundleRequired:
+                return "风扇控制服务需要从包含已签名 helper 的 Mac-TaskManager.app 启动。当前开发启动方式不支持系统授权，请先构建并打开应用包。"
             case .unregisterTimedOut:
                 return "等待旧版风扇控制服务退出超时，请重新启动 Mac-TaskManager 后再试。"
             case .registrationDenied(let reason):
@@ -24,6 +27,17 @@ enum FanHelperRegistration {
 
     static var service: SMAppService {
         SMAppService.daemon(plistName: FanControlXPC.launchDaemonPlistName)
+    }
+
+    static var canRegisterFromCurrentBundle: Bool {
+        let appURL = Bundle.main.bundleURL
+        guard appURL.pathExtension == "app" else { return false }
+        let daemonURL = appURL.appendingPathComponent(
+            "Contents/Library/LaunchDaemons/\(FanControlXPC.launchDaemonPlistName)"
+        )
+        let helperURL = appURL.appendingPathComponent("Contents/Resources/MacFanHelper")
+        return FileManager.default.fileExists(atPath: daemonURL.path)
+            && FileManager.default.fileExists(atPath: helperURL.path)
     }
 
     static var currentBuild: String {
@@ -43,9 +57,18 @@ enum FanHelperRegistration {
     }
 
     static func registerOrRefresh() throws {
+        guard canRegisterFromCurrentBundle else {
+            throw RegistrationError.appBundleRequired
+        }
+
         let currentStatus = service.status
         switch currentStatus {
-        case .enabled, .requiresApproval:
+        case .enabled:
+            if isCurrentBuildRegistered {
+                return
+            }
+            try unregisterAndWait()
+        case .requiresApproval:
             if isCurrentBuildRegistered {
                 return
             }
@@ -62,12 +85,18 @@ enum FanHelperRegistration {
             break
         }
 
+        // Keep the build marker across System Settings approval, even if
+        // macOS reports the pending registration as an error.
+        UserDefaults.standard.set(currentBuild, forKey: registeredBuildKey)
         do {
             try service.register()
         } catch {
+            if service.status == .enabled || service.status == .requiresApproval {
+                UserDefaults.standard.removeObject(forKey: onboardingDismissedBuildKey)
+                return
+            }
             throw RegistrationError.registrationDenied(error.localizedDescription)
         }
-        UserDefaults.standard.set(currentBuild, forKey: registeredBuildKey)
         UserDefaults.standard.removeObject(forKey: onboardingDismissedBuildKey)
     }
 
@@ -116,13 +145,26 @@ final class FirstLaunchAuthorizationModel: ObservableObject {
     @Published private(set) var isWorking = false
 
     func start() {
+        guard FanHelperRegistration.canRegisterFromCurrentBundle else { return }
         refresh(presentWhenNeeded: true)
+    }
+
+    var canOpenSystemSettings: Bool {
+        switch phase {
+        case .requiresApproval:
+            return true
+        case .failed:
+            return FanHelperRegistration.canRegisterFromCurrentBundle
+        default:
+            return false
+        }
     }
 
     func refresh(presentWhenNeeded: Bool = false) {
         guard !isWorking else { return }
 
-        switch FanHelperRegistration.service.status {
+        let status = FanHelperRegistration.service.status
+        switch status {
         case .enabled:
             if FanHelperRegistration.isCurrentBuildRegistered {
                 phase = .enabled
@@ -130,7 +172,8 @@ final class FirstLaunchAuthorizationModel: ObservableObject {
             } else {
                 phase = .needsUpdate
                 if presentWhenNeeded
-                    && !FanHelperRegistration.wasOnboardingDismissedForCurrentBuild {
+                    && (phase == .needsUpdate
+                        || !FanHelperRegistration.wasOnboardingDismissedForCurrentBuild) {
                     isPresented = true
                 }
             }
@@ -139,10 +182,14 @@ final class FirstLaunchAuthorizationModel: ObservableObject {
                 ? .requiresApproval
                 : .needsUpdate
             if presentWhenNeeded
-                && !FanHelperRegistration.wasOnboardingDismissedForCurrentBuild {
+                && (phase == .needsUpdate
+                    || !FanHelperRegistration.wasOnboardingDismissedForCurrentBuild) {
                 isPresented = true
             }
         case .notRegistered, .notFound:
+            if case .failed = phase {
+                return
+            }
             phase = .notRegistered
             if presentWhenNeeded
                 && !FanHelperRegistration.wasOnboardingDismissedForCurrentBuild {
@@ -158,7 +205,7 @@ final class FirstLaunchAuthorizationModel: ObservableObject {
 
     func enableFullFunctionality() {
         if phase == .requiresApproval {
-            FanHelperRegistration.openSystemSettings()
+            refresh()
             return
         }
 
@@ -180,9 +227,6 @@ final class FirstLaunchAuthorizationModel: ObservableObject {
                 switch result {
                 case .success:
                     self.refresh()
-                    if self.phase == .requiresApproval {
-                        FanHelperRegistration.openSystemSettings()
-                    }
                 case .failure(let error):
                     self.phase = .failed(error.localizedDescription)
                     self.isPresented = true
@@ -250,6 +294,14 @@ struct FirstLaunchAuthorizationView: View {
                 .buttonStyle(.bordered)
                 .disabled(model.isWorking)
 
+                if model.canOpenSystemSettings {
+                    Button("打开系统设置") {
+                        model.openSystemSettings()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.isWorking)
+                }
+
                 Button(primaryButtonTitle) {
                     model.enableFullFunctionality()
                 }
@@ -265,6 +317,13 @@ struct FirstLaunchAuthorizationView: View {
         .padding(28)
         .frame(width: 520)
         .background(TaskManagerStyle.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(TaskManagerStyle.border, lineWidth: 1)
+        }
+        .shadow(color: Color.black.opacity(0.18), radius: 24, y: 12)
+        .accessibilityAddTraits(.isModal)
         .onReceive(
             NotificationCenter.default.publisher(
                 for: NSApplication.didBecomeActiveNotification
@@ -300,7 +359,7 @@ struct FirstLaunchAuthorizationView: View {
         case .needsUpdate:
             return "应用版本已更新。按 Apple 要求刷新 helper 注册，确保新签名和新路径生效。"
         case .requiresApproval:
-            return "请在“系统设置 → 通用 → 登录项与扩展”中允许 Mac-TaskManager。"
+            return "请在“系统设置 → 通用 → 登录项与扩展 → 允许在后台”中允许 Mac-TaskManager。完成后返回此处点击“重新检查”。"
         case .enabled:
             return "授权已经完成，可以直接使用全部功能。"
         case .failed(let message):
@@ -311,7 +370,7 @@ struct FirstLaunchAuthorizationView: View {
     private var primaryButtonTitle: String {
         switch model.phase {
         case .requiresApproval:
-            return "打开系统设置"
+            return "重新检查"
         case .needsUpdate:
             return "更新并启用"
         case .failed:

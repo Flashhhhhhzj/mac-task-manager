@@ -1762,8 +1762,21 @@ struct ContentView: View {
         .sheet(isPresented: $state.showRunTaskDialog) {
             RunTaskDialog(monitor: monitor, state: state)
         }
-        .sheet(isPresented: $authorization.isPresented) {
-            FirstLaunchAuthorizationView(model: authorization)
+        .allowsHitTesting(!authorization.isPresented)
+        .accessibilityHidden(authorization.isPresented)
+        .overlay {
+            if authorization.isPresented {
+                ZStack {
+                    Color.clear
+                        .ignoresSafeArea()
+                        .contentShape(Rectangle())
+                        .onTapGesture {}
+
+                    FirstLaunchAuthorizationView(model: authorization)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .zIndex(200)
+            }
         }
         .alert(
             "导出系统运行日志",
@@ -1785,7 +1798,19 @@ struct ContentView: View {
         .onAppear {
             state.selectedPID = nil
             AppTheme.applyToApplication(state.selectedAppTheme)
+            if NSApp.isActive {
+                authorization.start()
+            }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+        ) { _ in
             authorization.start()
+        }
+        .onChange(of: authorization.isPresented) { isPresented in
+            if isPresented {
+                TaskManagerFocus.clearSearchFocus()
+            }
         }
         .onChange(of: state.appTheme) { _ in
             AppTheme.applyToApplication(state.selectedAppTheme)

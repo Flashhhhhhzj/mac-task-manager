@@ -103,6 +103,7 @@ final class FanControlModel: ObservableObject {
     private let temperatureHistoryLimit = 30
     private var refreshTimer: Timer?
     private var refreshInProgress = false
+    private var waitingForHelperAuthorization = false
     private var noticeDismissWorkItem: DispatchWorkItem?
     private var isFanPageVisible = false
     private var coolModeRequestInProgress = false
@@ -152,6 +153,20 @@ final class FanControlModel: ObservableObject {
                     self.temperatures = snapshot.temperatures
                     self.updateTemperatureHistories(with: snapshot.temperatures)
                     self.helperAuthorizationState = helperState
+                    if self.waitingForHelperAuthorization {
+                        switch helperState {
+                        case .requiresApproval:
+                            self.waitingForHelperAuthorization = false
+                            self.errorMessage = nil
+                            self.showNotice("请在“登录项与扩展”中允许 Mac-TaskManager 后台运行。")
+                        case .enabled:
+                            self.waitingForHelperAuthorization = false
+                            self.errorMessage = nil
+                            self.showNotice("一次性授权已完成，后续调整不再重复输入密码。")
+                        default:
+                            break
+                        }
+                    }
                     self.availabilityMessage =
                         snapshot.fans.isEmpty && snapshot.temperatures.isEmpty
                         ? "这台 Mac 没有向系统报告可读取的风扇或温度传感器。"
@@ -300,7 +315,6 @@ final class FanControlModel: ObservableObject {
                     self.isRegisteringHelper = false
                     if state == .requiresApproval {
                         self.showNotice("请在“登录项与扩展”中允许 Mac-TaskManager 后台运行。")
-                        PrivilegedFanControl.openSystemSettings()
                     } else if state == .enabled {
                         self.showNotice("一次性授权已完成，后续调整不再重复输入密码。")
                     }
@@ -308,9 +322,19 @@ final class FanControlModel: ObservableObject {
             } catch {
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    self.helperAuthorizationState = PrivilegedFanControl.authorizationState()
+                    let state = PrivilegedFanControl.authorizationState()
+                    self.helperAuthorizationState = state
                     self.isRegisteringHelper = false
-                    self.errorMessage = self.friendlyMessage(for: error)
+                    if state == .requiresApproval {
+                        self.errorMessage = nil
+                        self.showNotice("请在“登录项与扩展”中允许 Mac-TaskManager 后台运行。")
+                    } else if state == .enabled {
+                        self.errorMessage = nil
+                        self.showNotice("一次性授权已完成，后续调整不再重复输入密码。")
+                    } else {
+                        self.waitingForHelperAuthorization = true
+                        self.errorMessage = self.friendlyMessage(for: error)
+                    }
                 }
             }
         }
@@ -711,7 +735,8 @@ private enum PrivilegedFanControl {
     }
 
     static func authorizationState() -> FanHelperAuthorizationState {
-        switch FanHelperRegistration.service.status {
+        let status = FanHelperRegistration.service.status
+        switch status {
         case .notRegistered:
             return .notRegistered
         case .enabled:
