@@ -13,11 +13,16 @@ APP_NAME="Mac-TaskManager"
 TARGET_NAME="MacTaskManager"
 FAN_HELPER_NAME="MacFanHelper"
 FAN_HELPER_SERVICE="local.Mac-TaskManager.FanHelper"
-APP_VERSION="${APP_VERSION:-1.0.0}"
-APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-4}"
-BETA_TAG="${BETA_TAG:-beta.2}"
+RELEASE_VERSION="$(<VERSION)"
+if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+    echo "❌ VERSION 文件必须使用 semver 格式，例如 1.0.0 或 1.0.0-beta.2。"
+    exit 1
+fi
+APP_VERSION="${RELEASE_VERSION%%-*}"
+APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-5}"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
+LOCAL_UNSIGNED_BUILD=0
 
 if [ -z "$CODESIGN_IDENTITY" ]; then
     CODESIGN_IDENTITY="$(
@@ -28,8 +33,17 @@ if [ -z "$CODESIGN_IDENTITY" ]; then
 fi
 
 if [ -z "$CODESIGN_IDENTITY" ]; then
-    echo "❌ 未找到 Developer ID Application 签名。"
-    echo "   持久化特权 Helper 必须使用可信开发者签名，不能使用临时 ad-hoc 签名。"
+    if [ "${ALLOW_UNSIGNED_LOCAL_BUILD:-0}" = "1" ]; then
+        LOCAL_UNSIGNED_BUILD=1
+    else
+        echo "❌ 未找到 Developer ID Application 签名。"
+        echo "   发布版需要可信开发者签名；本地界面预览可用 ALLOW_UNSIGNED_LOCAL_BUILD=1。"
+        exit 1
+    fi
+fi
+
+if [ "$LOCAL_UNSIGNED_BUILD" = "1" ] && [ -n "$NOTARY_PROFILE" ]; then
+    echo "❌ 未签名的本地构建不能提交公证。"
     exit 1
 fi
 
@@ -131,18 +145,22 @@ EOF
     plutil -lint "$app_dir/Contents/Info.plist"
     plutil -lint "$app_dir/Contents/Library/LaunchDaemons/$FAN_HELPER_SERVICE.plist"
 
-    codesign \
-        --force \
-        --options runtime \
-        --timestamp \
-        --sign "$CODESIGN_IDENTITY" \
-        "$app_dir/Contents/Resources/$FAN_HELPER_NAME"
-    codesign \
-        --force \
-        --options runtime \
-        --timestamp \
-        --sign "$CODESIGN_IDENTITY" \
-        "$app_dir"
+    if [ "$LOCAL_UNSIGNED_BUILD" = "1" ]; then
+        echo "⚠️ 本地预览跳过签名；此应用不能注册或运行风扇特权服务。"
+    else
+        codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --sign "$CODESIGN_IDENTITY" \
+            "$app_dir/Contents/Resources/$FAN_HELPER_NAME"
+        codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --sign "$CODESIGN_IDENTITY" \
+            "$app_dir"
+    fi
 
     echo "✅ [$target_arch] 编译与签名完成: $app_dir"
 }
@@ -154,27 +172,111 @@ create_dmg_package() {
     local dist_dir
     dist_dir="$(dirname "$dmg_path")"
     mkdir -p "$dist_dir"
+    local volume_name="$APP_NAME-Layout-$$"
 
-    local dmg_root="$dist_dir/dmg-root"
-    rm -rf "$dmg_root"
-    mkdir -p "$dmg_root"
+    local work_dir
+    work_dir="$(mktemp -d "$dist_dir/.dmg-work.XXXXXX")"
+    local dmg_root="$work_dir/root"
+    local writable_dmg="$work_dir/writable.dmg"
+    local mountpoint
+    local volume_device
+    local attach_output
+    mkdir -p "$dmg_root/.background"
     cp -R "$app_dir" "$dmg_root/"
     ln -s /Applications "$dmg_root/Applications"
+    cp assets/dmg-background.png "$dmg_root/.background/dmg-background.png"
 
     rm -f "$dmg_path"
     hdiutil create \
-        -volname "$APP_NAME" \
+        -volname "$volume_name" \
         -srcfolder "$dmg_root" \
+        -fs HFS+ \
         -ov \
-        -format UDZO \
-        "$dmg_path"
-    rm -rf "$dmg_root"
+        -format UDRW \
+        "$writable_dmg"
 
-    codesign \
-        --force \
-        --timestamp \
-        --sign "$CODESIGN_IDENTITY" \
-        "$dmg_path"
+    attach_output="$(hdiutil attach \
+        -readwrite \
+        -noverify \
+        -noautoopen \
+        "$writable_dmg")"
+    volume_device="$(printf '%s\n' "$attach_output" | awk '$2 == "Apple_HFS" { print $1; exit }')"
+    mountpoint="$(printf '%s\n' "$attach_output" | awk '$2 == "Apple_HFS" { $1 = ""; $2 = ""; sub(/^[[:space:]]+/, ""); print; exit }')"
+    if [ -z "$volume_device" ] || [ -z "$mountpoint" ]; then
+        echo "❌ 无法找到刚挂载的 DMG 卷。" >&2
+        rm -rf "$work_dir"
+        return 1
+    fi
+
+    if ! osascript - "$volume_name" "$mountpoint" <<'APPLESCRIPT'
+on run argv
+    set diskName to item 1 of argv
+    set mountDir to item 2 of argv
+    tell application "Finder"
+    set dmgDisk to disk (diskName as string)
+    open dmgDisk
+    set xOrigin to 100
+    set yOrigin to 100
+    set windowWidth to 560
+    set windowHeight to 400
+    set dmgWindow to container window of dmgDisk
+    set current view of dmgWindow to icon view
+    set toolbar visible of dmgWindow to false
+    set statusbar visible of dmgWindow to false
+    set pathbar visible of dmgWindow to false
+    set bounds of dmgWindow to {xOrigin, yOrigin, xOrigin + windowWidth, yOrigin + windowHeight}
+    set viewOptions to icon view options of dmgWindow
+    set icon size of viewOptions to 96
+    set text size of viewOptions to 12
+    set arrangement of viewOptions to not arranged
+    set background picture of viewOptions to file ".background:dmg-background.png" of dmgDisk
+    set position of item "Mac-TaskManager.app" of dmgWindow to {150, 170}
+    set position of item "Applications" of dmgWindow to {410, 170}
+    close dmgWindow
+    open dmgDisk
+    delay 1
+    set dmgWindow to container window of dmgDisk
+    set statusbar visible of dmgWindow to false
+    set pathbar visible of dmgWindow to false
+    set bounds of dmgWindow to {xOrigin, yOrigin, xOrigin + windowWidth - 10, yOrigin + windowHeight - 10}
+    delay 1
+    set statusbar visible of dmgWindow to false
+    set pathbar visible of dmgWindow to false
+    set bounds of dmgWindow to {xOrigin, yOrigin, xOrigin + windowWidth, yOrigin + windowHeight}
+    delay 3
+    end tell
+set dsStore to quoted form of (mountDir & "/.DS_Store")
+repeat 10 times
+    if (do shell script "test -s " & dsStore & "; echo $?") is "0" then return
+    delay 1
+end repeat
+error "Finder did not create the DMG layout metadata."
+end run
+APPLESCRIPT
+    then
+        hdiutil detach "$volume_device" -quiet || true
+        rm -rf "$work_dir"
+        return 1
+    fi
+
+    diskutil rename "$volume_device" "$APP_NAME"
+    hdiutil detach "$volume_device" -quiet
+    hdiutil convert "$writable_dmg" \
+        -format UDZO \
+        -imagekey zlib-level=9 \
+        -ov \
+        -o "$dmg_path"
+    rm -rf "$work_dir"
+
+    if [ "$LOCAL_UNSIGNED_BUILD" = "1" ]; then
+        echo "⚠️ 本地预览 DMG 未签名或公证，只用于检查安装窗口。"
+    else
+        codesign \
+            --force \
+            --timestamp \
+            --sign "$CODESIGN_IDENTITY" \
+            "$dmg_path"
+    fi
 
     if [ -n "$NOTARY_PROFILE" ]; then
         xcrun notarytool submit \
@@ -189,6 +291,8 @@ create_dmg_package() {
         echo "⚠️ 未设置 NOTARY_PROFILE：当前 DMG 仅适合本地测试，不应直接对外发布。"
     fi
 
+    scripts/verify-macos-dmg-finder-layout.sh "$dmg_path"
+
     echo "💿 DMG: $dmg_path"
 }
 
@@ -201,20 +305,15 @@ if [ "${1:-}" = "dmg" ]; then
 
     if [ "$ARCH_TARGET" = "all" ] || [ "$ARCH_TARGET" = "arm64" ]; then
         build_app_bundle "arm64" "./$APP_NAME.app"
-        VERSIONED_ARM64="$DIST_DIR/$APP_NAME-v$APP_VERSION-$BETA_TAG-arm64.dmg"
-        PLAIN_ARM64="$DIST_DIR/$APP_NAME-arm64.dmg"
+        VERSIONED_ARM64="$DIST_DIR/$APP_NAME-v$RELEASE_VERSION-arm64.dmg"
         create_dmg_package "./$APP_NAME.app" "$VERSIONED_ARM64"
-        cp -f "$VERSIONED_ARM64" "$PLAIN_ARM64"
-        cp -f "$VERSIONED_ARM64" "$DIST_DIR/$APP_NAME.dmg"
     fi
 
     if [ "$ARCH_TARGET" = "all" ] || [ "$ARCH_TARGET" = "x64" ] || [ "$ARCH_TARGET" = "x86_64" ]; then
         X64_APP_DIR="./$APP_NAME-x64.app"
         build_app_bundle "x86_64" "$X64_APP_DIR"
-        VERSIONED_X64="$DIST_DIR/$APP_NAME-v$APP_VERSION-$BETA_TAG-x64.dmg"
-        PLAIN_X64="$DIST_DIR/$APP_NAME-x64.dmg"
+        VERSIONED_X64="$DIST_DIR/$APP_NAME-v$RELEASE_VERSION-x64.dmg"
         create_dmg_package "$X64_APP_DIR" "$VERSIONED_X64"
-        cp -f "$VERSIONED_X64" "$PLAIN_X64"
         rm -rf "$X64_APP_DIR"
     fi
 
