@@ -96,7 +96,7 @@ CPU / GPU 占用 ─┐
 
 ### 安装发布版 DMG
 
-1. 打开 `Mac-TaskManager.dmg`，将 **Mac-TaskManager** 拖到“应用程序”。
+1. 下载与 Mac 架构匹配的 `Mac-TaskManager-v<版本号>-arm64.dmg`（Apple 芯片）或 `Mac-TaskManager-v<版本号>-x64.dmg`（Intel），将 **Mac-TaskManager** 拖到“应用程序”。
 2. 从“应用程序”启动它；Dock 和状态栏都会保留入口。
 3. 直接使用进程与性能页。需要风扇控制时，再根据首次引导完成一次系统批准。
 4. 在“设置”中选择主题、结束任务方式、清凉模式策略，以及是否保存监控日志。
@@ -134,24 +134,43 @@ swift run -c release CoolModeAlgorithmChecks
 
 ## 打包可分发 DMG
 
-构建发布包时，版本号和构建号都应明确指定；其中 `APP_BUILD_NUMBER` 必须单调递增，以便更新后重新注册 Helper。
+版本号统一保存在根目录 `VERSION`。每次发布前用同步脚本更新它；DMG 文件名和 App 内版本会从该文件读取。`APP_BUILD_NUMBER` 必须单调递增，以便更新后重新注册 Helper。
 
 ```sh
-APP_VERSION="1.0.0" \
-APP_BUILD_NUMBER="100" \
-./build.sh dmg
+./scripts/sync-version.sh 1.0.0-beta.3
+APP_BUILD_NUMBER="5" ./build.sh dmg
 ```
 
 面向外部用户分发时，请使用 Apple 公证。先在钥匙串创建 App Store Connect 凭据配置文件，再提供其名称：
 
 ```sh
-APP_VERSION="1.0.0" \
-APP_BUILD_NUMBER="100" \
+APP_BUILD_NUMBER="5" \
 NOTARY_PROFILE="MacTaskManager-Notary" \
 ./build.sh dmg
 ```
 
-脚本会签名 App 和 DMG，并在提供 `NOTARY_PROFILE` 时提交公证、装订票据和验证结果。未提供该配置时，生成的 DMG 仅适合本地测试，不应直接对外发布。
+脚本只生成带版本号和架构后缀的 DMG（例如 `Mac-TaskManager-v1.0.0-beta.3-arm64.dmg`），不再额外复制无版本号的重复文件。它会签名 App 和 DMG，并在提供 `NOTARY_PROFILE` 时提交公证、装订票据和验证结果。未提供该配置时，生成的 DMG 仅适合本地测试，不应直接对外发布。
+
+没有 Developer ID 证书时，可以生成未签名的本地预览包来检查界面和 DMG Finder 布局：
+
+```sh
+ALLOW_UNSIGNED_LOCAL_BUILD=1 ./build.sh dmg arm64
+```
+
+该预览包不能注册特权风扇服务；对外发布仍需 Developer ID 签名与 Apple 公证。
+
+## GitHub Actions
+
+PR 和 `main` 推送会编译 App 与风扇 Helper，并运行清凉模式算法自检。推送与 `VERSION` 完全一致的 `v<版本号>` 标签会构建并公证 arm64、x64 两个 DMG，只发布这两个带版本号的安装包；重跑现有标签时会先替换该 Release 中旧的 Mac-TaskManager DMG。
+
+自动发布前，需要在仓库 Actions secrets 中配置：
+
+- `MACOS_CERTIFICATE_P12_BASE64`：Developer ID Application 证书及私钥的 Base64 内容；
+- `MACOS_CERTIFICATE_PASSWORD`：证书导出密码；
+- `MACOS_SIGNING_IDENTITY`：钥匙串中的完整签名身份名称；
+- `APPLE_NOTARY_API_KEY_P8`、`APPLE_NOTARY_API_KEY_ID`、`APPLE_NOTARY_ISSUER_ID`：Apple 公证 API 凭据。
+
+私钥和 API 密钥只存放在 GitHub Actions secrets，不要提交到仓库。
 
 ## 架构速览
 

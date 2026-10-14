@@ -1,0 +1,174 @@
+name: macOS Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build signed DMG (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-26
+          - arch: x64
+            runner: macos-26-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+      APPLE_NOTARY_API_KEY_P8: ${{ secrets.APPLE_NOTARY_API_KEY_P8 }}
+      APPLE_NOTARY_API_KEY_ID: ${{ secrets.APPLE_NOTARY_API_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate tag and required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          configured_version="$(<VERSION)"
+          if [[ "$tag_version" != "$configured_version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match VERSION ($configured_version)." >&2
+            exit 1
+          fi
+
+          for name in \
+            MACOS_CERTIFICATE_P12_BASE64 \
+            MACOS_CERTIFICATE_PASSWORD \
+            MACOS_SIGNING_IDENTITY \
+            APPLE_NOTARY_API_KEY_P8 \
+            APPLE_NOTARY_API_KEY_ID \
+            APPLE_NOTARY_ISSUER_ID; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
+
+      - name: Import Developer ID certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          certificate_path="$RUNNER_TEMP/developer-id.p12"
+          keychain_path="$RUNNER_TEMP/app-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security default-keychain -s "$keychain_path"
+
+      - name: Configure Apple notarization credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          api_key_path="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_API_KEY_ID}.p8"
+          printf '%s' "$APPLE_NOTARY_API_KEY_P8" > "$api_key_path"
+          chmod 600 "$api_key_path"
+          xcrun notarytool store-credentials MacTaskManager-Notary \
+            --key "$api_key_path" \
+            --key-id "$APPLE_NOTARY_API_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID"
+
+      - name: Build, sign, notarize, and verify DMG
+        env:
+          APP_BUILD_NUMBER: ${{ github.run_number }}
+          CODESIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          NOTARY_PROFILE: MacTaskManager-Notary
+        run: ./build.sh dmg "${{ matrix.arch }}"
+
+      - name: Upload architecture DMG
+        uses: actions/upload-artifact@v6
+        with:
+          name: Mac-TaskManager-${{ matrix.arch }}
+          path: dist/Mac-TaskManager-${{ github.ref_name }}-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download arm64 DMG
+        uses: actions/download-artifact@v6
+        with:
+          name: Mac-TaskManager-arm64
+          path: dist
+
+      - name: Download x64 DMG
+        uses: actions/download-artifact@v6
+        with:
+          name: Mac-TaskManager-x64
+          path: dist
+
+      - name: Publish only the two canonical DMGs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$VERSION"
+          version="${tag#v}"
+          arm64_dmg="dist/Mac-TaskManager-v${version}-arm64.dmg"
+          x64_dmg="dist/Mac-TaskManager-v${version}-x64.dmg"
+          test -s "$arm64_dmg"
+          test -s "$x64_dmg"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "$arm64_dmg" "$x64_dmg" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            while IFS= read -r asset; do
+              case "$asset" in
+                "Mac-TaskManager-v${version}-arm64.dmg"|"Mac-TaskManager-v${version}-x64.dmg")
+                  continue
+                  ;;
+              esac
+              gh release delete-asset "$tag" "$asset" \
+                --repo "$GITHUB_REPOSITORY" \
+                --yes
+            done < <(
+              gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets \
+                --jq '.assets[].name | select(startswith("Mac-TaskManager") and endswith(".dmg"))'
+            )
+          else
+            release_args=(
+              --repo "$GITHUB_REPOSITORY"
+              --target "$GITHUB_SHA"
+              --title "Mac-TaskManager $version"
+              --generate-notes
+            )
+            if [[ "$version" == *-* ]]; then
+              release_args+=(--prerelease)
+            fi
+            gh release create "$tag" "$arm64_dmg" "$x64_dmg" "${release_args[@]}"
+          fi
