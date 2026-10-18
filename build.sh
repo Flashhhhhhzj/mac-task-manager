@@ -1,5 +1,5 @@
 #!/bin/bash
-# 构建脚本 - 编译并运行 Mac-TaskManager
+# 构建脚本 - 编译、打包并运行 Mac-TaskManager，不使用开发者签名或公证
 
 set -euo pipefail
 
@@ -20,32 +20,6 @@ if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za
 fi
 APP_VERSION="${RELEASE_VERSION%%-*}"
 APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-5}"
-CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
-NOTARY_PROFILE="${NOTARY_PROFILE:-}"
-LOCAL_UNSIGNED_BUILD=0
-
-if [ -z "$CODESIGN_IDENTITY" ]; then
-    CODESIGN_IDENTITY="$(
-        security find-identity -v -p codesigning |
-            sed -n 's/.*"\(Developer ID Application:[^"]*\)"/\1/p' |
-            head -n 1
-    )"
-fi
-
-if [ -z "$CODESIGN_IDENTITY" ]; then
-    if [ "${ALLOW_UNSIGNED_LOCAL_BUILD:-0}" = "1" ]; then
-        LOCAL_UNSIGNED_BUILD=1
-    else
-        echo "❌ 未找到 Developer ID Application 签名。"
-        echo "   发布版需要可信开发者签名；本地界面预览可用 ALLOW_UNSIGNED_LOCAL_BUILD=1。"
-        exit 1
-    fi
-fi
-
-if [ "$LOCAL_UNSIGNED_BUILD" = "1" ] && [ -n "$NOTARY_PROFILE" ]; then
-    echo "❌ 未签名的本地构建不能提交公证。"
-    exit 1
-fi
 
 build_app_bundle() {
     local target_arch="${1:-arm64}"
@@ -145,24 +119,8 @@ EOF
     plutil -lint "$app_dir/Contents/Info.plist"
     plutil -lint "$app_dir/Contents/Library/LaunchDaemons/$FAN_HELPER_SERVICE.plist"
 
-    if [ "$LOCAL_UNSIGNED_BUILD" = "1" ]; then
-        echo "⚠️ 本地预览跳过签名；此应用不能注册或运行风扇特权服务。"
-    else
-        codesign \
-            --force \
-            --options runtime \
-            --timestamp \
-            --sign "$CODESIGN_IDENTITY" \
-            "$app_dir/Contents/Resources/$FAN_HELPER_NAME"
-        codesign \
-            --force \
-            --options runtime \
-            --timestamp \
-            --sign "$CODESIGN_IDENTITY" \
-            "$app_dir"
-    fi
-
-    echo "✅ [$target_arch] 编译与签名完成: $app_dir"
+    echo "✅ [$target_arch] 编译与打包完成（无开发者签名）: $app_dir"
+    echo "ℹ️ 当前未签名包可读取监控数据；风扇调速所需的特权服务尚不可用。"
 }
 
 create_dmg_package() {
@@ -182,7 +140,7 @@ create_dmg_package() {
     local volume_device
     local attach_output
     mkdir -p "$dmg_root/.background"
-    cp -R "$app_dir" "$dmg_root/"
+    cp -R "$app_dir" "$dmg_root/$APP_NAME.app"
     ln -s /Applications "$dmg_root/Applications"
     cp assets/dmg-background.png "$dmg_root/.background/dmg-background.png"
 
@@ -268,32 +226,9 @@ APPLESCRIPT
         -o "$dmg_path"
     rm -rf "$work_dir"
 
-    if [ "$LOCAL_UNSIGNED_BUILD" = "1" ]; then
-        echo "⚠️ 本地预览 DMG 未签名或公证，只用于检查安装窗口。"
-    else
-        codesign \
-            --force \
-            --timestamp \
-            --sign "$CODESIGN_IDENTITY" \
-            "$dmg_path"
-    fi
-
-    if [ -n "$NOTARY_PROFILE" ]; then
-        xcrun notarytool submit \
-            "$dmg_path" \
-            --keychain-profile "$NOTARY_PROFILE" \
-            --wait
-        xcrun stapler staple "$dmg_path"
-        xcrun stapler validate "$dmg_path"
-        spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
-        echo "✅ Apple 公证与票据装订完成"
-    else
-        echo "⚠️ 未设置 NOTARY_PROFILE：当前 DMG 仅适合本地测试，不应直接对外发布。"
-    fi
-
     scripts/verify-macos-dmg-finder-layout.sh "$dmg_path"
 
-    echo "💿 DMG: $dmg_path"
+    echo "💿 DMG（未签名、未公证）: $dmg_path"
 }
 
 rm -rf ./MacSystemMonitor ./MacSystemMonitor.app ./MacTaskManager ./MacTaskManager.app
@@ -318,8 +253,7 @@ if [ "${1:-}" = "dmg" ]; then
     fi
 
     echo ""
-    echo "🎉 所有指定架构 DMG 打包完成！输出文件如下："
-    ls -lh "$DIST_DIR"/*.dmg
+    echo "🎉 所有指定架构 DMG 打包完成！"
     exit 0
 fi
 

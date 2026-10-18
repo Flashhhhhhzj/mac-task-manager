@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build signed DMG (${{ matrix.arch }})
+    name: Build unsigned DMG (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -24,19 +24,11 @@ jobs:
           - arch: x64
             runner: macos-26-intel
     runs-on: ${{ matrix.runner }}
-    env:
-      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-      APPLE_NOTARY_API_KEY_P8: ${{ secrets.APPLE_NOTARY_API_KEY_P8 }}
-      APPLE_NOTARY_API_KEY_ID: ${{ secrets.APPLE_NOTARY_API_KEY_ID }}
-      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Validate tag and required secrets
+      - name: Validate tag
         shell: bash
         run: |
           set -euo pipefail
@@ -47,60 +39,9 @@ jobs:
             exit 1
           fi
 
-          for name in \
-            MACOS_CERTIFICATE_P12_BASE64 \
-            MACOS_CERTIFICATE_PASSWORD \
-            MACOS_SIGNING_IDENTITY \
-            APPLE_NOTARY_API_KEY_P8 \
-            APPLE_NOTARY_API_KEY_ID \
-            APPLE_NOTARY_ISSUER_ID; do
-            if [[ -z "${!name:-}" ]]; then
-              echo "::error::Missing GitHub Actions secret: $name"
-              exit 1
-            fi
-          done
-
-      - name: Import Developer ID certificate
-        shell: bash
-        run: |
-          set -euo pipefail
-          certificate_path="$RUNNER_TEMP/developer-id.p12"
-          keychain_path="$RUNNER_TEMP/app-signing.keychain-db"
-          keychain_password="$(openssl rand -base64 32)"
-
-          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate_path"
-          security create-keychain -p "$keychain_password" "$keychain_path"
-          security set-keychain-settings -lut 21600 "$keychain_path"
-          security unlock-keychain -p "$keychain_password" "$keychain_path"
-          security import "$certificate_path" \
-            -k "$keychain_path" \
-            -P "$MACOS_CERTIFICATE_PASSWORD" \
-            -T /usr/bin/codesign
-          security set-key-partition-list \
-            -S apple-tool:,apple: \
-            -s \
-            -k "$keychain_password" \
-            "$keychain_path"
-          security list-keychains -d user -s "$keychain_path"
-          security default-keychain -s "$keychain_path"
-
-      - name: Configure Apple notarization credentials
-        shell: bash
-        run: |
-          set -euo pipefail
-          api_key_path="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_API_KEY_ID}.p8"
-          printf '%s' "$APPLE_NOTARY_API_KEY_P8" > "$api_key_path"
-          chmod 600 "$api_key_path"
-          xcrun notarytool store-credentials MacTaskManager-Notary \
-            --key "$api_key_path" \
-            --key-id "$APPLE_NOTARY_API_KEY_ID" \
-            --issuer "$APPLE_NOTARY_ISSUER_ID"
-
-      - name: Build, sign, notarize, and verify DMG
+      - name: Build and verify unsigned DMG
         env:
           APP_BUILD_NUMBER: ${{ github.run_number }}
-          CODESIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-          NOTARY_PROFILE: MacTaskManager-Notary
         run: ./build.sh dmg "${{ matrix.arch }}"
 
       - name: Upload architecture DMG

@@ -37,6 +37,8 @@
 | **诊断日志** | 默认不留存。你可以主动开启最近 60 分钟的本地监控、风扇与清凉模式决策记录，再导出为 ZIP 诊断包。 |
 | **原生体验** | 支持浅色、深色、跟随系统主题；保留 Dock 图标与顶部状态栏入口，点击状态栏可快速查看正在运行的应用。 |
 
+> 当前构建只编译和打包，不使用开发者证书签名，也不提交 Apple 公证。进程、性能与可读取的风扇和温度数据仍可使用；现有特权 Helper 依赖同团队签名验证，因此当前包暂不能使用手动调速和清凉模式。
+
 ## 一眼看懂清凉模式
 
 清凉模式的目标不是宣称“直接测得键盘或掌托表面温度”——应用并不这样做。它是一个本地、确定性的短时散热压力预测器：在系统温度真正冲高前，先根据工作负载和温升趋势提高散热力度。
@@ -70,17 +72,26 @@ CPU / GPU 占用 ─┐
 - 进程、CPU、GPU、内存、磁盘、网络与可读取的温度数据：无需额外管理员权限。
 - 没有可读取风扇的机型会明确显示不支持，不会伪造控制能力。
 
-### 需要一次性授权的部分
+### 风扇调速的当前限制
 
-写入风扇转速属于系统级操作。首次启用完整风扇控制时，应用会引导你安装并批准签名验证的 `MacFanHelper` 后台服务：
+写入风扇转速通过 root 后台服务 `MacFanHelper` 执行。现有实现使用 `SMAppService` 注册服务，并在 XPC 连接时检查主应用与 Helper 的 Apple 签名和 Team ID。当前未使用开发者签名的构建不满足这条授权链路，点击“授权并启用”也不能使调速生效。
 
-1. 在应用内点击“授权并启用”；
-2. 按 macOS 指引到“系统设置 → 通用 → 登录项与扩展”完成批准；
-3. 返回应用后即可使用手动转速与清凉模式，日常操作无需反复输入密码。
-
-这是 macOS 的安全模型：应用不能替用户静默批准 root 后台服务。后续版本升级时，请递增 `APP_BUILD_NUMBER`，使系统按新签名和新路径刷新 Helper 注册。
+风扇页仍会直接读取 AppleSMC 提供的温度与转速。要恢复手动调速和清凉模式，需要另行实现经过管理员授权、具有客户端身份校验的特权服务安装与通信方案。
 
 > 手动设置和清凉模式都不会突破硬件报告的 RPM 边界。应用退出、清凉模式异常或后台心跳中断时，风扇会恢复为 macOS 自动策略。
+
+### 不使用开发者签名的调速方案（待实现）
+
+推荐改用管理员明确授权安装的独立 LaunchDaemon：安装程序将 Helper 与 plist 放入 root 管理、普通用户不可写的系统目录，由 `launchd` 启动。主应用继续以普通用户运行，通过现有 XPC 协议请求调速。Apple 的 [LaunchDaemon 文档](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)描述了这种部署方式。
+
+这条路线需要替换两处现有实现：
+
+- **注册与状态检测**：改为管理员授权的安装、升级、卸载，以及独立服务的版本与连接检测，不再依赖 `SMAppService.status`。
+- **请求授权**：移除对 Apple 签名及 Team ID 的依赖，改用本应用专用的 Authorization Services 权限。客户端通过系统授权对话框获取授权凭据，Helper 校验凭据与对应权限后才允许调速，并检查连接身份；不能直接删除签名检查后接受所有连接。Apple 的[权限提升说明](https://developer.apple.com/forums/thread/708765)和[授权凭据跨进程传递接口](https://developer.apple.com/documentation/security/authorizationmakeexternalform(_:_:))给出了这些机制。
+
+现有 RPM 范围校验、清凉模式心跳超时恢复和异常回退都应保留。该设计不需要开发者证书或公证，但仍需要管理员授权，并需在目标 macOS 与硬件上验证。单靠提高进程权限不能保证固件接受风扇写入。
+
+临时手动测试也可以扩展 Helper 的 CLI，增加固定的调速、恢复自动命令，再由用户在终端通过 `sudo` 执行；当前 CLI 只有只读命令，尚不具备这个功能。这种一次一条命令的方式不适合清凉模式持续调速。整个图形应用以 root 身份运行则不在推荐方案内，Apple 的权限提升说明也明确反对这种做法。
 
 ## 隐私与运行日志
 
@@ -98,7 +109,7 @@ CPU / GPU 占用 ─┐
 
 1. 下载与 Mac 架构匹配的 `Mac-TaskManager-v<版本号>-arm64.dmg`（Apple 芯片）或 `Mac-TaskManager-v<版本号>-x64.dmg`（Intel），将 **Mac-TaskManager** 拖到“应用程序”。
 2. 从“应用程序”启动它；Dock 和状态栏都会保留入口。
-3. 直接使用进程与性能页。需要风扇控制时，再根据首次引导完成一次系统批准。
+3. 直接使用进程与性能页；风扇页可查看可读取的转速和温度，当前调速限制见上文。
 4. 在“设置”中选择主题、结束任务方式、清凉模式策略，以及是否保存监控日志。
 
 ### 从源码构建
@@ -106,24 +117,17 @@ CPU / GPU 占用 ─┐
 **要求**
 
 - macOS 13 或更高版本；
-- 完整 Xcode 或可用的 Swift 工具链；
-- 用于构建可安装风扇 Helper 的 `Developer ID Application` 签名身份。
+- 完整 Xcode 或可用的 Swift 工具链。
 
 ```sh
 git clone https://github.com/Flashhhhhhzj/Mac-TaskManager.git
 cd Mac-TaskManager
 
-# 编译、签名并生成 Mac-TaskManager.app
+# 编译并生成 Mac-TaskManager.app，不签名、不公证
 ./build.sh
 
 # 启动已构建应用
 open Mac-TaskManager.app
-```
-
-如果需要指定签名身份：
-
-```sh
-CODESIGN_IDENTITY="Developer ID Application: Example (TEAMID)" ./build.sh
 ```
 
 运行清凉模式算法自检：
@@ -132,45 +136,31 @@ CODESIGN_IDENTITY="Developer ID Application: Example (TEAMID)" ./build.sh
 swift run -c release CoolModeAlgorithmChecks
 ```
 
-## 打包可分发 DMG
+## 打包 DMG
 
-版本号统一保存在根目录 `VERSION`。每次发布前用同步脚本更新它；DMG 文件名和 App 内版本会从该文件读取。`APP_BUILD_NUMBER` 必须单调递增，以便更新后重新注册 Helper。
+版本号统一保存在根目录 `VERSION`。每次发布前用同步脚本更新它；DMG 文件名和 App 内版本会从该文件读取。`APP_BUILD_NUMBER` 用于应用包的 `CFBundleVersion`。
 
 ```sh
 ./scripts/sync-version.sh 1.0.0-beta.3
 APP_BUILD_NUMBER="5" ./build.sh dmg
 ```
 
-面向外部用户分发时，请使用 Apple 公证。先在钥匙串创建 App Store Connect 凭据配置文件，再提供其名称：
+默认生成 arm64 和 x64 两个 DMG，也可以只打包指定架构：
 
 ```sh
-APP_BUILD_NUMBER="5" \
-NOTARY_PROFILE="MacTaskManager-Notary" \
-./build.sh dmg
+./build.sh dmg arm64
+./build.sh dmg x64
 ```
 
-脚本只生成带版本号和架构后缀的 DMG（例如 `Mac-TaskManager-v1.0.0-beta.3-arm64.dmg`），不再额外复制无版本号的重复文件。它会签名 App 和 DMG，并在提供 `NOTARY_PROFILE` 时提交公证、装订票据和验证结果。未提供该配置时，生成的 DMG 仅适合本地测试，不应直接对外发布。
+脚本只生成带版本号和架构后缀的 DMG（例如 `Mac-TaskManager-v1.0.0-beta.3-arm64.dmg`），保留安装窗口布局检查；不读取钥匙串、不导入证书、不执行签名、公证或票据装订。旧的签名和公证环境变量不再参与构建。
 
-没有 Developer ID 证书时，可以生成未签名的本地预览包来检查界面和 DMG Finder 布局：
-
-```sh
-ALLOW_UNSIGNED_LOCAL_BUILD=1 ./build.sh dmg arm64
-```
-
-该预览包不能注册特权风扇服务；对外发布仍需 Developer ID 签名与 Apple 公证。
+Apple 芯片上的可执行文件可能由链接器自动生成 ad-hoc 签名，这是[平台的运行要求](https://developer.apple.com/documentation/xcode/embedding-a-helper-tool-in-a-sandboxed-app)，不包含开发者证书或公司身份；构建脚本不会额外执行签名。未公证的下载包可能被 Gatekeeper 阻止，用户需在信任来源的前提下通过[“系统设置 → 隐私与安全性”允许打开](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac)。
 
 ## GitHub Actions
 
-PR 和 `main` 推送会编译 App 与风扇 Helper，并运行清凉模式算法自检。推送与 `VERSION` 完全一致的 `v<版本号>` 标签会构建并公证 arm64、x64 两个 DMG，只发布这两个带版本号的安装包；重跑现有标签时会先替换该 Release 中旧的 Mac-TaskManager DMG。
+PR 和 `main` 推送会编译 App 与风扇 Helper，并运行清凉模式算法自检。推送与 `VERSION` 完全一致的 `v<版本号>` 标签会构建 arm64、x64 两个未签名、未公证的 DMG，只发布这两个带版本号的安装包；重跑现有标签时会先替换该 Release 中旧的 Mac-TaskManager DMG。
 
-自动发布前，需要在仓库 Actions secrets 中配置：
-
-- `MACOS_CERTIFICATE_P12_BASE64`：Developer ID Application 证书及私钥的 Base64 内容；
-- `MACOS_CERTIFICATE_PASSWORD`：证书导出密码；
-- `MACOS_SIGNING_IDENTITY`：钥匙串中的完整签名身份名称；
-- `APPLE_NOTARY_API_KEY_P8`、`APPLE_NOTARY_API_KEY_ID`、`APPLE_NOTARY_ISSUER_ID`：Apple 公证 API 凭据。
-
-私钥和 API 密钥只存放在 GitHub Actions secrets，不要提交到仓库。
+自动构建不再读取签名证书、证书密码或 Apple 公证 API 的 Actions secrets。
 
 ## 架构速览
 
