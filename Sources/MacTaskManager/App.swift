@@ -3803,6 +3803,24 @@ struct SettingsPage: View {
 
                 SettingsSectionTitle("散热")
                 SettingsOptionRow(
+                    icon: "lock.shield",
+                    title: "风扇控制服务",
+                    subtitle: fanControl.helperAuthorizationState.isEnabled
+                        ? "已完成授权，日常调速与重启无需重复输入密码"
+                        : "首次启用时自动安装，只需在系统窗口完成管理员授权"
+                ) {
+                    if fanControl.isRegisteringHelper {
+                        ProgressView().controlSize(.small)
+                    } else if fanControl.helperAuthorizationState.isEnabled {
+                        Button("移除服务") { fanControl.removePersistentHelper() }
+                            .buttonStyle(.bordered)
+                    } else {
+                        Button("启用 / 修复") { fanControl.enablePersistentHelper() }
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
+                .padding(.bottom, 12)
+                SettingsOptionRow(
                     icon: "snowflake",
                     title: "清凉模式策略",
                     subtitle: "选择清凉模式的降温与风噪取舍"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# 构建脚本 - 编译、打包并运行 Mac-TaskManager，不使用开发者签名或公证
+# 构建脚本 - 仅使用无证书 ad-hoc 签名，不使用开发者身份或公证
 
 set -euo pipefail
 
@@ -12,14 +12,13 @@ mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULE_CACHE_PATH"
 APP_NAME="Mac-TaskManager"
 TARGET_NAME="MacTaskManager"
 FAN_HELPER_NAME="MacFanHelper"
-FAN_HELPER_SERVICE="local.Mac-TaskManager.FanHelper"
 RELEASE_VERSION="$(<VERSION)"
 if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
     echo "❌ VERSION 文件必须使用 semver 格式，例如 1.0.0 或 1.0.0-beta.2。"
     exit 1
 fi
 APP_VERSION="${RELEASE_VERSION%%-*}"
-APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-5}"
+APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-7}"
 
 build_app_bundle() {
     local target_arch="${1:-arm64}"
@@ -51,12 +50,8 @@ EOF
     rm -rf "$app_dir"
     mkdir -p \
         "$app_dir/Contents/MacOS" \
-        "$app_dir/Contents/Resources" \
-        "$app_dir/Contents/Library/LaunchDaemons"
+        "$app_dir/Contents/Resources"
     cp "$bin_path" "$app_dir/Contents/MacOS/$APP_NAME"
-    # SMAppService LaunchDaemons resolve BundleProgram relative to the app bundle.
-    # Keep the helper in Resources, matching Apple's documented bundle layout and
-    # avoiding stale registrations that point at an earlier helper location.
     cp "$helper_path" "$app_dir/Contents/Resources/$FAN_HELPER_NAME"
     chmod 755 "$app_dir/Contents/Resources/$FAN_HELPER_NAME"
     cp assets/app-icon.svg "$app_dir/Contents/Resources/app-icon.svg"
@@ -94,33 +89,15 @@ EOF
 </plist>
 EOF
 
-    cat > "$app_dir/Contents/Library/LaunchDaemons/$FAN_HELPER_SERVICE.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>$FAN_HELPER_SERVICE</string>
-    <key>BundleProgram</key>
-    <string>Contents/Resources/$FAN_HELPER_NAME</string>
-    <key>MachServices</key>
-    <dict>
-        <key>$FAN_HELPER_SERVICE</key>
-        <true/>
-    </dict>
-    <key>AssociatedBundleIdentifiers</key>
-    <array>
-        <string>local.Mac-TaskManager</string>
-    </array>
-</dict>
-</plist>
-EOF
-
     plutil -lint "$app_dir/Contents/Info.plist"
-    plutil -lint "$app_dir/Contents/Library/LaunchDaemons/$FAN_HELPER_SERVICE.plist"
 
-    echo "✅ [$target_arch] 编译与打包完成（无开发者签名）: $app_dir"
-    echo "ℹ️ 当前未签名包可读取监控数据；风扇调速所需的特权服务尚不可用。"
+    # 链接器签名未封装 App 资源；先签 Helper，再封装完整 App。
+    codesign --force --sign - --timestamp=none "$app_dir/Contents/Resources/$FAN_HELPER_NAME"
+    codesign --force --sign - --timestamp=none "$app_dir"
+    codesign --verify --deep --strict --verbose=2 "$app_dir"
+
+    echo "✅ [$target_arch] 编译与打包完成（ad-hoc 签名，无开发者证书）: $app_dir"
+    echo "ℹ️ 首次打开应用后，点击“启用完整功能”并完成系统管理员授权即可配置风扇服务。"
 }
 
 create_dmg_package() {
@@ -228,7 +205,7 @@ APPLESCRIPT
 
     scripts/verify-macos-dmg-finder-layout.sh "$dmg_path"
 
-    echo "💿 DMG（未签名、未公证）: $dmg_path"
+    echo "💿 DMG（内含 ad-hoc App，未公证）: $dmg_path"
 }
 
 rm -rf ./MacSystemMonitor ./MacSystemMonitor.app ./MacTaskManager ./MacTaskManager.app

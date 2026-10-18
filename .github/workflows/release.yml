@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build unsigned DMG (${{ matrix.arch }})
+    name: Build ad-hoc app DMG (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -39,7 +39,7 @@ jobs:
             exit 1
           fi
 
-      - name: Build and verify unsigned DMG
+      - name: Build and verify ad-hoc app DMG
         env:
           APP_BUILD_NUMBER: ${{ github.run_number }}
         run: ./build.sh dmg "${{ matrix.arch }}"

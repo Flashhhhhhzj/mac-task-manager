@@ -1,329 +1,240 @@
 import Darwin
 import Foundation
 import MacSMC
-import Security
 
 private enum HelperCommand {
     case status
     case temperatureKeys
+    case install(UInt32)
+    case uninstall
 
     init(arguments: [String]) throws {
-        guard arguments.count == 2 else {
-            throw HelperError.usage
+        if arguments.count == 3, arguments[1] == "install", let uid = UInt32(arguments[2]) {
+            self = .install(uid)
+            return
         }
-
+        guard arguments.count == 2 else { throw HelperError.usage }
         switch arguments[1] {
-        case "status":
-            self = .status
-        case "temperature-keys":
-            self = .temperatureKeys
-        default:
-            throw HelperError.usage
+        case "status": self = .status
+        case "temperature-keys": self = .temperatureKeys
+        case "uninstall": self = .uninstall
+        default: throw HelperError.usage
         }
     }
 }
 
 private enum HelperError: LocalizedError {
     case rootRequired
-    case untrustedClient
+    case invalidRequest
+    case recovering
     case usage
 
     var errorDescription: String? {
         switch self {
-        case .rootRequired:
-            return "风扇控制服务必须由 macOS 以管理员身份启动"
-        case .untrustedClient:
-            return "拒绝了未通过代码签名验证的客户端"
-        case .usage:
-            return "用法：MacFanHelper status | temperature-keys"
+        case .rootRequired: return "风扇服务必须由系统管理员授权安装后启动。"
+        case .invalidRequest: return "风扇控制参数无效。"
+        case .recovering: return "正在将上次中断的风扇控制恢复为系统自动，请稍后重试。"
+        case .usage: return "用法：MacFanHelper status | temperature-keys | install <用户 UID> | uninstall"
         }
     }
 }
 
 private final class FanControlService: NSObject, FanControlXPCProtocol {
-    private let queue = DispatchQueue(
-        label: "local.Mac-TaskManager.FanHelper.operations",
-        qos: .userInitiated
-    )
-    private let coolModeHeartbeatTimeout: TimeInterval = 10
+    private let queue = DispatchQueue(label: "local.Mac-TaskManager.FanHelper.operations", qos: .userInitiated)
+    private var controlledFanIndexes: Set<Int>
     private var coolModeFanIndexes = Set<Int>()
     private var lastCoolModeTargets: [Int: Double] = [:]
-    private var lastCoolModeHeartbeat: Date?
+    private var lastHeartbeat = Date.distantPast
+    private var recovering: Bool
     private var watchdog: DispatchSourceTimer?
 
-    override init() {
+    init(recoveryIndexes: [Int]) {
+        controlledFanIndexes = Set(recoveryIndexes)
+        recovering = !recoveryIndexes.isEmpty
         super.init()
-
         let watchdog = DispatchSource.makeTimerSource(queue: queue)
         watchdog.schedule(deadline: .now() + 1, repeating: 1)
         watchdog.setEventHandler { [weak self] in
-            self?.restoreAutomaticAfterHeartbeatTimeoutIfNeeded()
+            guard let self, !self.controlledFanIndexes.isEmpty,
+                  self.recovering || Date().timeIntervalSince(self.lastHeartbeat) >= 10 else { return }
+            try? self.restore(self.controlledFanIndexes, using: SMCController())
         }
         watchdog.resume()
         self.watchdog = watchdog
     }
 
-    deinit {
-        watchdog?.cancel()
-    }
-
-    var hasActiveCoolMode: Bool {
-        queue.sync {
-            !coolModeFanIndexes.isEmpty
-        }
-    }
+    deinit { watchdog?.cancel() }
 
     func ping(withReply reply: @escaping (Bool, String?) -> Void) {
-        reply(true, nil)
+        reply(true, FanControlXPC.protocolVersion)
     }
 
-    func setFanRPM(
-        index: Int,
-        rpm: Double,
-        withReply reply: @escaping (Bool, String?) -> Void
-    ) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            do {
-                try self.restoreCoolModeFansIfNeeded()
-                try SMCController().setFanRPM(index: index, rpm: rpm)
-                reply(true, nil)
-            } catch {
-                reply(false, error.localizedDescription)
-            }
+    func heartbeat(withReply reply: @escaping (Bool, String?) -> Void) {
+        queue.async {
+            if !self.recovering { self.lastHeartbeat = Date() }
+            reply(true, nil)
         }
     }
 
-    func setFanAutomatic(
-        index: Int,
-        withReply reply: @escaping (Bool, String?) -> Void
-    ) {
-        queue.async { [weak self] in
-            guard let self else { return }
+    func restoreAll(withReply reply: @escaping (Bool, String?) -> Void) {
+        queue.async {
             do {
-                try self.restoreCoolModeFansIfNeeded()
-                try SMCController().setFanAutomatic(index: index)
-                reply(true, nil)
-            } catch {
-                reply(false, error.localizedDescription)
-            }
-        }
-    }
-
-    func updateCoolModeTargets(
-        indexes: [NSNumber],
-        rpms: [NSNumber],
-        withReply reply: @escaping (Bool, String?) -> Void
-    ) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            guard !indexes.isEmpty, indexes.count == rpms.count else {
-                reply(false, "清凉模式没有收到有效的风扇目标转速。")
-                return
-            }
-
-            do {
-                let controller = try SMCController()
-                for (indexValue, rpmValue) in zip(indexes, rpms) {
-                    let index = indexValue.intValue
-                    let rpm = rpmValue.doubleValue
-                    let previousRPM = self.lastCoolModeTargets[index]
-
-                    if previousRPM.map({ abs($0 - rpm) >= 50 }) ?? true {
-                        try controller.setFanRPM(index: index, rpm: rpm)
-                        self.lastCoolModeTargets[index] = rpm
-                    }
-                    self.coolModeFanIndexes.insert(index)
+                if !self.controlledFanIndexes.isEmpty {
+                    try self.restore(self.controlledFanIndexes, using: SMCController())
                 }
-                self.lastCoolModeHeartbeat = Date()
                 reply(true, nil)
-            } catch {
-                // A target batch can fail after an earlier fan was changed.
-                // Never leave that partial batch in manual mode without a
-                // heartbeat: immediately return every tracked fan to macOS.
-                try? self.restoreCoolModeFansIfNeeded()
-                reply(false, error.localizedDescription)
+            } catch { reply(false, error.localizedDescription) }
+        }
+    }
+
+    func setFanRPM(index: Int, rpm: Double, withReply reply: @escaping (Bool, String?) -> Void) {
+        perform(reply) { controller in
+            try self.restore(self.coolModeFanIndexes, using: controller)
+            try self.track(index, using: controller)
+            try controller.setFanRPM(index: index, rpm: rpm)
+        }
+    }
+
+    func setFanAutomatic(index: Int, withReply reply: @escaping (Bool, String?) -> Void) {
+        perform(reply) { controller in
+            try self.restore(self.coolModeFanIndexes, using: controller)
+            try controller.setFanAutomatic(index: index)
+            self.controlledFanIndexes.remove(index)
+            try self.saveJournal()
+        }
+    }
+
+    func updateCoolModeTargets(indexes: [NSNumber], rpms: [NSNumber],
+                               withReply reply: @escaping (Bool, String?) -> Void) {
+        perform(reply) { controller in
+            guard !indexes.isEmpty, indexes.count <= 32, indexes.count == rpms.count,
+                  indexes.allSatisfy({ $0.doubleValue.isFinite && $0.doubleValue == Double($0.intValue) }),
+                  Set(indexes.map(\.intValue)).count == indexes.count,
+                  rpms.allSatisfy({ $0.doubleValue.isFinite }) else { throw HelperError.invalidRequest }
+            for (indexValue, rpmValue) in zip(indexes, rpms) {
+                let index = indexValue.intValue
+                let rpm = rpmValue.doubleValue
+                if self.lastCoolModeTargets[index].map({ abs($0 - rpm) >= 50 }) ?? true {
+                    try self.track(index, using: controller)
+                    try controller.setFanRPM(index: index, rpm: rpm)
+                    self.lastCoolModeTargets[index] = rpm
+                }
+                self.coolModeFanIndexes.insert(index)
             }
         }
     }
 
     func stopCoolMode(withReply reply: @escaping (Bool, String?) -> Void) {
-        queue.async { [weak self] in
-            guard let self else { return }
+        perform(reply) { controller in try self.restore(self.coolModeFanIndexes, using: controller) }
+    }
+
+    func shutdown() {
+        queue.sync {
+            if !controlledFanIndexes.isEmpty {
+                try? restore(controlledFanIndexes, using: SMCController())
+            }
+        }
+    }
+
+    private func perform(_ reply: @escaping (Bool, String?) -> Void,
+                         _ operation: @escaping (SMCController) throws -> Void) {
+        queue.async {
             do {
-                try self.restoreCoolModeFansIfNeeded()
+                guard !self.recovering else { throw HelperError.recovering }
+                try operation(SMCController())
+                self.lastHeartbeat = Date()
                 reply(true, nil)
             } catch {
+                // A failed write may already have switched a fan to manual mode.
+                if !self.controlledFanIndexes.isEmpty {
+                    try? self.restore(self.controlledFanIndexes, using: SMCController())
+                }
                 reply(false, error.localizedDescription)
             }
         }
     }
 
-    private func restoreAutomaticAfterHeartbeatTimeoutIfNeeded() {
-        guard let lastCoolModeHeartbeat,
-              Date().timeIntervalSince(lastCoolModeHeartbeat) >= coolModeHeartbeatTimeout,
-              !coolModeFanIndexes.isEmpty else {
-            return
-        }
-
-        do {
-            try restoreCoolModeFansIfNeeded()
-        } catch {
-            // Keep the mode marked active and retry after another timeout.
-            self.lastCoolModeHeartbeat = Date()
-        }
+    private func track(_ index: Int, using controller: SMCController) throws {
+        guard (0..<min(try controller.fanCount(), 32)).contains(index) else { throw HelperError.invalidRequest }
+        controlledFanIndexes.insert(index)
+        // Persist the intent before touching hardware so a restarted helper can recover it.
+        try saveJournal()
     }
 
-    private func restoreCoolModeFansIfNeeded() throws {
-        guard !coolModeFanIndexes.isEmpty else {
-            lastCoolModeHeartbeat = nil
-            lastCoolModeTargets = [:]
-            return
-        }
+    private func saveJournal() throws {
+        try FanHelperInstallation.writeProtectedData(JSONEncoder().encode(controlledFanIndexes.sorted()),
+            to: FanHelperInstallation.recoveryPath, mode: 0o600)
+    }
 
-        let controller = try SMCController()
-        for index in coolModeFanIndexes.sorted() {
-            try controller.setFanAutomatic(index: index)
+    private func restore(_ indexes: Set<Int>, using controller: SMCController) throws {
+        guard !indexes.isEmpty else { return }
+        var firstError: Error?
+        for index in indexes.sorted() {
+            do {
+                try controller.setFanAutomatic(index: index)
+                controlledFanIndexes.remove(index)
+                coolModeFanIndexes.remove(index)
+                lastCoolModeTargets.removeValue(forKey: index)
+            } catch { if firstError == nil { firstError = error } }
         }
-        coolModeFanIndexes = []
-        lastCoolModeTargets = [:]
-        lastCoolModeHeartbeat = nil
+        try saveJournal()
+        if controlledFanIndexes.isEmpty { recovering = false }
+        if let firstError { throw firstError }
     }
 }
 
 private final class FanControlListenerDelegate: NSObject, NSXPCListenerDelegate {
-    private let service = FanControlService()
-    private let clientRequirement: SecRequirement?
+    let service: FanControlService
+    private let installation: FanHelperInstallation
 
-    var hasActiveCoolMode: Bool {
-        service.hasActiveCoolMode
-    }
-
-    override init() {
-        clientRequirement = Self.makeClientRequirement()
+    init(installation: FanHelperInstallation, recoveryIndexes: [Int]) {
+        self.installation = installation
+        service = FanControlService(recoveryIndexes: recoveryIndexes)
         super.init()
     }
 
-    func listener(
-        _ listener: NSXPCListener,
-        shouldAcceptNewConnection newConnection: NSXPCConnection
-    ) -> Bool {
-        guard let clientRequirement,
-              Self.isTrusted(newConnection, requirement: clientRequirement) else {
-            return false
-        }
-
-        newConnection.exportedInterface = NSXPCInterface(
-            with: FanControlXPCProtocol.self
-        )
-        newConnection.exportedObject = service
-        newConnection.resume()
+    func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
+        guard installation.allowsUser(connection.effectiveUserIdentifier) else { return false }
+        connection.exportedInterface = NSXPCInterface(with: FanControlXPCProtocol.self)
+        connection.exportedObject = service
+        connection.resume()
         return true
-    }
-
-    private static func makeClientRequirement() -> SecRequirement? {
-        guard let teamIdentifier = currentTeamIdentifier() else {
-            return nil
-        }
-
-        let requirementText =
-            "anchor apple generic and identifier \"\(FanControlXPC.mainApplicationIdentifier)\" " +
-            "and certificate leaf[subject.OU] = \"\(teamIdentifier)\""
-        var requirement: SecRequirement?
-        let status = SecRequirementCreateWithString(
-            requirementText as CFString,
-            [],
-            &requirement
-        )
-        guard status == errSecSuccess else {
-            return nil
-        }
-        return requirement
-    }
-
-    private static func currentTeamIdentifier() -> String? {
-        var dynamicCode: SecCode?
-        var staticCode: SecStaticCode?
-        guard SecCodeCopySelf([], &dynamicCode) == errSecSuccess,
-              let dynamicCode,
-              SecCodeCopyStaticCode(
-            dynamicCode,
-            [],
-            &staticCode
-        ) == errSecSuccess,
-              let staticCode else {
-            return nil
-        }
-
-        var signingInformation: CFDictionary?
-        let status = SecCodeCopySigningInformation(
-            staticCode,
-            SecCSFlags(rawValue: kSecCSSigningInformation),
-            &signingInformation
-        )
-        guard status == errSecSuccess,
-              let information = signingInformation as? [CFString: Any] else {
-            return nil
-        }
-        return information[kSecCodeInfoTeamIdentifier] as? String
-    }
-
-    private static func isTrusted(
-        _ connection: NSXPCConnection,
-        requirement: SecRequirement
-    ) -> Bool {
-        let attributes = [
-            kSecGuestAttributePid: NSNumber(value: connection.processIdentifier)
-        ] as CFDictionary
-        var guestCode: SecCode?
-        guard SecCodeCopyGuestWithAttributes(
-            nil,
-            attributes,
-            [],
-            &guestCode
-        ) == errSecSuccess,
-              let guestCode else {
-            return false
-        }
-
-        return SecCodeCheckValidity(guestCode, [], requirement) == errSecSuccess
     }
 }
 
 private func runDaemon() throws -> Never {
-    guard geteuid() == 0 else {
-        throw HelperError.rootRequired
+    guard geteuid() == 0 else { throw HelperError.rootRequired }
+    guard let installation = try FanHelperInstallation.load() else {
+        throw FanHelperInstallation.InstallationError.invalidRecord
     }
-
-    let delegate = FanControlListenerDelegate()
+    try FanHelperInstallation.verifyPath(FanHelperInstallation.helperPath)
+    let binary = try Data(contentsOf: URL(fileURLWithPath: FanHelperInstallation.helperPath))
+    guard FanHelperInstallation.digest(binary) == installation.helperSHA256 else {
+        throw FanHelperInstallation.InstallationError.invalidRecord
+    }
+    let delegate = FanControlListenerDelegate(installation: installation,
+        recoveryIndexes: try HelperInstaller.recoveryIndexes())
     let listener = NSXPCListener(machServiceName: FanControlXPC.serviceName)
     listener.delegate = delegate
     listener.resume()
 
-    func exitWhenIdle() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
-            if delegate.hasActiveCoolMode {
-                exitWhenIdle()
-            } else {
-                exit(EXIT_SUCCESS)
-            }
-        }
+    signal(SIGTERM, SIG_IGN)
+    signal(SIGINT, SIG_IGN)
+    let termination = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+    let interruption = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    for source in [termination, interruption] {
+        source.setEventHandler { delegate.service.shutdown(); exit(EXIT_SUCCESS) }
+        source.resume()
     }
-    exitWhenIdle()
-
-    withExtendedLifetime(delegate) {
-        RunLoop.current.run()
-    }
+    withExtendedLifetime((listener, delegate, termination, interruption)) { RunLoop.current.run() }
     fatalError("风扇控制服务意外退出")
 }
 
 private func runCommandLineTool() throws {
     let command = try HelperCommand(arguments: CommandLine.arguments)
-    let controller = try SMCController()
-
     switch command {
     case .status:
-        let snapshot = try controller.snapshot()
+        let snapshot = try SMCController().snapshot()
         print("model=\(snapshot.hardwareModel) fans=\(snapshot.fans.count)")
         for fan in snapshot.fans {
             print(
@@ -339,8 +250,14 @@ private func runCommandLineTool() throws {
                 "name=\(sensor.name) celsius=\(String(format: "%.1f", sensor.celsius))"
             )
         }
+    case .install(let uid):
+        try HelperInstaller.install(for: uid)
+        print("风扇控制服务已安装，当前用户已获授权。")
+    case .uninstall:
+        try HelperInstaller.uninstall()
+        print("风扇控制服务已移除。")
     case .temperatureKeys:
-        for sensor in controller.availableTemperatureKeys() {
+        for sensor in try SMCController().availableTemperatureKeys() {
             print("\(sensor.key)=\(String(format: "%.1f", sensor.celsius))")
         }
     }

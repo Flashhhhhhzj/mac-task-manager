@@ -37,10 +37,7 @@ let package = Package(
         .executableTarget(
             name: "MacFanHelper",
             dependencies: ["MacSMC"],
-            path: "Sources/MacFanHelper",
-            linkerSettings: [
-                .linkedFramework("Security")
-            ]
+            path: "Sources/MacFanHelper"
         ),
         .executableTarget(
             name: "CoolModeAlgorithmChecks",

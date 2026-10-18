@@ -102,6 +102,8 @@ final class FanControlModel: ObservableObject {
     private let queue = DispatchQueue(label: "Mac-TaskManager.fan-control", qos: .userInitiated)
     private let temperatureHistoryLimit = 30
     private var refreshTimer: Timer?
+    private var heartbeatTimer: Timer?
+    private var heartbeatInProgress = false
     private var refreshInProgress = false
     private var waitingForHelperAuthorization = false
     private var noticeDismissWorkItem: DispatchWorkItem?
@@ -114,6 +116,23 @@ final class FanControlModel: ObservableObject {
         self.monitor = monitor
         self.monitoringLogs = monitoringLogs
         self.coolModePolicy = CoolModePreferences.currentPolicy
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            guard let self, !self.heartbeatInProgress else { return }
+            self.heartbeatInProgress = true
+            self.queue.async {
+                var state = FanHelperRegistration.authorizationState(checkConnection: false)
+                if state.isEnabled {
+                    do {
+                        try FanControlXPC.perform(timeout: 3) { proxy, reply in proxy.heartbeat(withReply: reply) }
+                    } catch { state = .unavailable(error.localizedDescription) }
+                }
+                let updatedState = state
+                DispatchQueue.main.async {
+                    self.helperAuthorizationState = updatedState
+                    self.heartbeatInProgress = false
+                }
+            }
+        }
     }
 
     func start() {
@@ -344,6 +363,33 @@ final class FanControlModel: ObservableObject {
         PrivilegedFanControl.openSystemSettings()
     }
 
+    func removePersistentHelper() {
+        guard !isRegisteringHelper else { return }
+        let alert = NSAlert()
+        alert.messageText = "移除风扇控制服务？"
+        alert.informativeText = "软件会先恢复系统自动散热，再请求管理员批准移除后台服务。监控功能仍可正常使用。"
+        alert.addButton(withTitle: "移除服务")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        isRegisteringHelper = true
+        queue.async {
+            do {
+                try FanHelperRegistration.uninstall()
+                DispatchQueue.main.async {
+                    self.completeCoolModeStop(showNotice: false)
+                    self.helperAuthorizationState = .notRegistered
+                    self.isRegisteringHelper = false
+                    self.showNotice("风扇控制服务已移除。")
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isRegisteringHelper = false
+                    self.errorMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
     func setCoolModePolicy(_ policy: CoolModePolicy) {
         guard coolModePolicy != policy else { return }
         coolModePolicy = policy
@@ -367,9 +413,9 @@ final class FanControlModel: ObservableObject {
     }
 
     func shutdown() {
-        guard hasAppliedCoolModeTargets else { return }
         recordCoolModeDecision(event: "shutdown")
-        try? PrivilegedFanControl.stopCoolMode()
+        try? PrivilegedFanControl.restoreAll()
+        heartbeatTimer?.invalidate()
         hasAppliedCoolModeTargets = false
         coolModeState = .off
         coolModeTargets = [:]
@@ -709,6 +755,7 @@ final class FanControlModel: ObservableObject {
 
     deinit {
         refreshTimer?.invalidate()
+        heartbeatTimer?.invalidate()
         noticeDismissWorkItem?.cancel()
     }
 }
@@ -735,23 +782,7 @@ private enum PrivilegedFanControl {
     }
 
     static func authorizationState() -> FanHelperAuthorizationState {
-        let status = FanHelperRegistration.service.status
-        switch status {
-        case .notRegistered:
-            return .notRegistered
-        case .enabled:
-            return FanHelperRegistration.isCurrentBuildRegistered
-                ? .enabled
-                : .needsUpdate
-        case .requiresApproval:
-            return FanHelperRegistration.isCurrentBuildRegistered
-                ? .requiresApproval
-                : .needsUpdate
-        case .notFound:
-            return .notRegistered
-        @unknown default:
-            return .unavailable("无法识别风扇控制服务状态。")
-        }
+        FanHelperRegistration.authorizationState()
     }
 
     static func register() throws {
@@ -791,70 +822,19 @@ private enum PrivilegedFanControl {
         }
     }
 
+    static func restoreAll() throws {
+        try perform { proxy, reply in proxy.restoreAll(withReply: reply) }
+    }
+
     private static func perform(
-        _ operation: (
-            FanControlXPCProtocol,
-            @escaping (Bool, String?) -> Void
-        ) -> Void
+        _ operation: @escaping (FanControlXPCProtocol, @escaping (Bool, String?) -> Void) -> Void
     ) throws {
-        guard authorizationState().isEnabled else {
+        guard FanHelperRegistration.authorizationState(checkConnection: false).isEnabled else {
             throw ControlError.helperNotEnabled
         }
-
-        let semaphore = DispatchSemaphore(value: 0)
-        let lock = NSLock()
-        var response: Result<Void, Error>?
-
-        func finish(_ result: Result<Void, Error>) {
-            lock.lock()
-            defer { lock.unlock() }
-            guard response == nil else { return }
-            response = result
-            semaphore.signal()
-        }
-
-        let connection = NSXPCConnection(
-            machServiceName: FanControlXPC.serviceName,
-            options: .privileged
-        )
-        connection.remoteObjectInterface = NSXPCInterface(
-            with: FanControlXPCProtocol.self
-        )
-        connection.interruptionHandler = {
-            finish(.failure(ControlError.connectionFailed("连接被中断。")))
-        }
-        connection.invalidationHandler = {
-            finish(.failure(ControlError.connectionFailed("连接已失效。")))
-        }
-        connection.resume()
-        defer {
-            connection.interruptionHandler = nil
-            connection.invalidationHandler = nil
-            connection.invalidate()
-        }
-
-        guard let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
-            finish(.failure(ControlError.connectionFailed(error.localizedDescription)))
-        }) as? FanControlXPCProtocol else {
-            throw ControlError.connectionFailed("无法创建服务代理。")
-        }
-
-        operation(proxy) { success, message in
-            if success {
-                finish(.success(()))
-            } else {
-                finish(.failure(ControlError.commandFailed(message ?? "")))
-            }
-        }
-
-        // The helper may spend up to 10 seconds waiting for macOS to release
-        // manual fan control, so leave enough time for XPC startup and the
-        // final SMC write to complete as well.
-        guard semaphore.wait(timeout: .now() + 15) == .success else {
-            throw ControlError.timeout
-        }
-        try response?.get()
+        try FanControlXPC.perform(operation)
     }
+
 }
 
 struct FanControlPage: View {
@@ -1335,7 +1315,7 @@ private struct FanHelperSetupBanner: View {
         case .notRegistered:
             return "启用免重复密码的风扇控制"
         case .needsUpdate:
-            return "应用已更新，需要刷新风扇控制服务"
+            return "后台服务需要更新"
         case .requiresApproval:
             return "还需要在系统设置中允许后台运行"
         case .enabled:
@@ -1352,7 +1332,7 @@ private struct FanHelperSetupBanner: View {
         case .notRegistered:
             return "首次启用需要管理员批准；之后调整转速不再反复输入密码。"
         case .needsUpdate:
-            return "更新后的 helper 必须重新注册，才能使用当前版本的签名和路径。"
+            return "点击更新并完成一次系统授权，软件会自动配置新版本后台服务。"
         case .requiresApproval:
             return "在“通用 → 登录项与扩展”中允许 Mac-TaskManager，然后返回这里。"
         case .enabled:

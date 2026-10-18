@@ -7,6 +7,7 @@ public enum SMCError: LocalizedError, Equatable {
     case keyNotFound(String)
     case invalidFanIndex(Int)
     case invalidRPM(Int, minimum: Int, maximum: Int)
+    case invalidRPMValue
     case ioKit(Int32)
     case firmware(UInt8)
     case timeout
@@ -23,6 +24,8 @@ public enum SMCError: LocalizedError, Equatable {
             return "风扇编号无效：\(index)"
         case .invalidRPM(let rpm, let minimum, let maximum):
             return "转速 \(rpm) RPM 超出安全范围 \(minimum)–\(maximum) RPM"
+        case .invalidRPMValue:
+            return "风扇转速或硬件报告的范围无效。"
         case .ioKit(let code):
             return "IOKit 操作失败（0x\(String(UInt32(bitPattern: code), radix: 16))）"
         case .firmware(let code):
@@ -188,6 +191,7 @@ public final class SMCController {
     }
 
     public func setFanRPM(index: Int, rpm: Double) throws {
+        guard Self.isFiniteRPM(rpm) else { throw SMCError.invalidRPMValue }
         let count = try fanCount()
         guard (0..<count).contains(index) else {
             throw SMCError.invalidFanIndex(index)
@@ -195,6 +199,9 @@ public final class SMCController {
 
         let minimum = try readFanValue(key: fanKey("F%dMn", index: index))
         let maximum = try readFanValue(key: fanKey("F%dMx", index: index))
+        guard Self.isFiniteRPM(minimum), Self.isFiniteRPM(maximum) else {
+            throw SMCError.invalidRPMValue
+        }
         let roundedRPM = Int(rpm.rounded())
         guard rpm >= minimum, rpm <= maximum, minimum > 0, maximum >= minimum else {
             throw SMCError.invalidRPM(
@@ -236,6 +243,10 @@ public final class SMCController {
         let targetKey = fanKey("F%dTg", index: index)
         let info = try keyInfo(targetKey)
         try writeKey(targetKey, bytes: SMCValueCodec.fanRPMBytes(rpm, size: info.dataSize))
+    }
+
+    public static func isFiniteRPM(_ rpm: Double) -> Bool {
+        rpm.isFinite && rpm >= 0 && rpm < Double(Int32.max)
     }
 
     public func setFanAutomatic(index: Int) throws {

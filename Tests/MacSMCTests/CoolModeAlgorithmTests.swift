@@ -26,9 +26,12 @@ enum CoolModeAlgorithmChecks {
         run("temperature feedback identifies missing sensors", failures: &failures) {
             try temperatureFeedbackRequirement()
         }
+        run("helper authorization and installation boundaries", failures: &failures) {
+            try FanHelperAuthorizationChecks.run()
+        }
 
         if failures.isEmpty {
-            print("CoolModeAlgorithmChecks: 7 checks passed")
+            print("CoolModeAlgorithmChecks: 8 checks passed")
         } else {
             failures.forEach { print("FAIL: \($0)") }
             exit(1)

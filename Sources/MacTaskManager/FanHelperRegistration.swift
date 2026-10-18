@@ -1,51 +1,45 @@
 import AppKit
+import Darwin
 import Foundation
 import MacSMC
 import ServiceManagement
 import SwiftUI
 
 enum FanHelperRegistration {
-    private static let registeredBuildKey = "FanHelperRegisteredBuild"
     private static let onboardingDismissedBuildKey = "FanHelperOnboardingDismissedBuild"
+    private static let installationLock = NSLock()
+    private static var helperURL: URL {
+        Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/MacFanHelper")
+    }
+    private static let bundledDigest: String? = {
+        guard let data = try? Data(contentsOf: helperURL) else { return nil }
+        return FanHelperInstallation.digest(data)
+    }()
 
     enum RegistrationError: LocalizedError {
         case appBundleRequired
-        case unregisterTimedOut
+        case canceled
         case registrationDenied(String)
 
         var errorDescription: String? {
             switch self {
             case .appBundleRequired:
-                return "风扇控制服务需要从包含已签名 helper 的 Mac-TaskManager.app 启动。当前开发启动方式不支持系统授权，请先构建并打开应用包。"
-            case .unregisterTimedOut:
-                return "等待旧版风扇控制服务退出超时，请重新启动 Mac-TaskManager 后再试。"
+                return "请从完整的 Mac-TaskManager.app 打开软件，再启用风扇控制。"
+            case .canceled:
+                return "已取消授权。你仍可查看监控数据，稍后可在风扇页面重新启用。"
             case .registrationDenied(let reason):
-                return "macOS 拒绝配置风扇控制服务。请确认应用位于“应用程序”文件夹，并在“系统设置 → 通用 → 登录项与扩展”中允许 Mac-TaskManager 后重试。\n\n\(reason)"
+                return "未能完成风扇服务配置，可以重新尝试。\n\n\(reason)"
             }
         }
     }
 
-    static var service: SMAppService {
-        SMAppService.daemon(plistName: FanControlXPC.launchDaemonPlistName)
-    }
-
     static var canRegisterFromCurrentBundle: Bool {
-        let appURL = Bundle.main.bundleURL
-        guard appURL.pathExtension == "app" else { return false }
-        let daemonURL = appURL.appendingPathComponent(
-            "Contents/Library/LaunchDaemons/\(FanControlXPC.launchDaemonPlistName)"
-        )
-        let helperURL = appURL.appendingPathComponent("Contents/Resources/MacFanHelper")
-        return FileManager.default.fileExists(atPath: daemonURL.path)
-            && FileManager.default.fileExists(atPath: helperURL.path)
+        Bundle.main.bundleURL.pathExtension == "app"
+            && FileManager.default.isExecutableFile(atPath: helperURL.path)
     }
 
     static var currentBuild: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0"
-    }
-
-    static var isCurrentBuildRegistered: Bool {
-        UserDefaults.standard.string(forKey: registeredBuildKey) == currentBuild
     }
 
     static var wasOnboardingDismissedForCurrentBuild: Bool {
@@ -56,93 +50,81 @@ enum FanHelperRegistration {
         UserDefaults.standard.set(currentBuild, forKey: onboardingDismissedBuildKey)
     }
 
-    static func registerOrRefresh() throws {
-        guard canRegisterFromCurrentBundle else {
-            throw RegistrationError.appBundleRequired
-        }
-
-        let currentStatus = service.status
-        switch currentStatus {
-        case .enabled:
-            if isCurrentBuildRegistered {
-                return
-            }
-            try unregisterAndWait()
-        case .requiresApproval:
-            if isCurrentBuildRegistered {
-                return
-            }
-            try unregisterAndWait()
-        case .notRegistered, .notFound:
-            // The app may have been replaced or moved while UserDefaults kept
-            // an old build marker. Try to remove an orphaned registration from
-            // an earlier helper path before creating the current one.
-            if isCurrentBuildRegistered {
-                try? unregisterAndWait()
-                UserDefaults.standard.removeObject(forKey: registeredBuildKey)
-            }
-        @unknown default:
-            break
-        }
-
-        // Keep the build marker across System Settings approval, even if
-        // macOS reports the pending registration as an error.
-        UserDefaults.standard.set(currentBuild, forKey: registeredBuildKey)
+    static func authorizationState(checkConnection: Bool = true) -> FanHelperAuthorizationState {
         do {
-            try service.register()
+            guard let record = try FanHelperInstallation.load() else { return .notRegistered }
+            guard record.allowsUser(getuid()) else { return .notRegistered }
+            guard let bundledDigest, record.helperSHA256 == bundledDigest else { return .needsUpdate }
+            try FanHelperInstallation.verifyPath(FanHelperInstallation.helperPath)
+            try FanHelperInstallation.verifyPath(FanHelperInstallation.plistPath)
+            let installed = try Data(contentsOf: URL(fileURLWithPath: FanHelperInstallation.helperPath))
+            guard FanHelperInstallation.digest(installed) == record.helperSHA256 else { return .needsUpdate }
+            if checkConnection { try FanControlXPC.checkConnection() }
+            return .enabled
         } catch {
-            if service.status == .enabled || service.status == .requiresApproval {
-                UserDefaults.standard.removeObject(forKey: onboardingDismissedBuildKey)
-                return
-            }
-            throw RegistrationError.registrationDenied(error.localizedDescription)
+            return .unavailable(error.localizedDescription)
         }
+    }
+
+    static func registerOrRefresh() throws {
+        try administratorCommand("install")
+        guard authorizationState(checkConnection: false).isEnabled else {
+            throw RegistrationError.registrationDenied("服务安装后校验未通过，请重新尝试。")
+        }
+        try FanControlXPC.checkConnection()
         UserDefaults.standard.removeObject(forKey: onboardingDismissedBuildKey)
+    }
+
+    static func uninstall() throws {
+        try administratorCommand("uninstall")
+        dismissOnboardingForCurrentBuild()
+    }
+
+    private static func administratorCommand(_ command: String) throws {
+        guard canRegisterFromCurrentBundle else { throw RegistrationError.appBundleRequired }
+        installationLock.lock()
+        defer { installationLock.unlock() }
+        let script = """
+        on run argv
+            set helperPath to item 1 of argv
+            set operationName to item 2 of argv
+            set userID to item 3 of argv
+            set shellCommand to quoted form of helperPath & " " & quoted form of operationName
+            if operationName is "install" then set shellCommand to shellCommand & " " & quoted form of userID
+            do shell script shellCommand with administrator privileges
+        end run
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script, "--", helperURL.path, command, String(getuid())]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            if output.contains("(-128)") { throw RegistrationError.canceled }
+            throw RegistrationError.registrationDenied(output.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
     }
 
     static func openSystemSettings() {
         SMAppService.openSystemSettingsLoginItems()
-    }
-
-    private static func unregisterAndWait() throws {
-        let semaphore = DispatchSemaphore(value: 0)
-        let lock = NSLock()
-        var unregisterError: Error?
-
-        service.unregister { error in
-            lock.lock()
-            unregisterError = error
-            lock.unlock()
-            semaphore.signal()
-        }
-
-        guard semaphore.wait(timeout: .now() + 15) == .success else {
-            throw RegistrationError.unregisterTimedOut
-        }
-
-        lock.lock()
-        let error = unregisterError
-        lock.unlock()
-        if let error {
-            throw error
-        }
     }
 }
 
 @MainActor
 final class FirstLaunchAuthorizationModel: ObservableObject {
     enum Phase: Equatable {
-        case checking
-        case notRegistered
-        case needsUpdate
-        case requiresApproval
-        case enabled
+        case checking, notRegistered, needsUpdate, requiresApproval, enabled
         case failed(String)
     }
 
     @Published var isPresented = false
     @Published private(set) var phase: Phase = .checking
     @Published private(set) var isWorking = false
+    private var isChecking = false
 
     func start() {
         guard FanHelperRegistration.canRegisterFromCurrentBundle else { return }
@@ -150,83 +132,45 @@ final class FirstLaunchAuthorizationModel: ObservableObject {
     }
 
     var canOpenSystemSettings: Bool {
-        switch phase {
-        case .requiresApproval:
-            return true
-        case .failed:
-            return FanHelperRegistration.canRegisterFromCurrentBundle
-        default:
-            return false
-        }
+        if case .failed = phase { return true }
+        return phase == .requiresApproval
     }
 
     func refresh(presentWhenNeeded: Bool = false) {
-        guard !isWorking else { return }
-
-        let status = FanHelperRegistration.service.status
-        switch status {
-        case .enabled:
-            if FanHelperRegistration.isCurrentBuildRegistered {
-                phase = .enabled
-                isPresented = false
-            } else {
-                phase = .needsUpdate
-                if presentWhenNeeded
-                    && (phase == .needsUpdate
-                        || !FanHelperRegistration.wasOnboardingDismissedForCurrentBuild) {
-                    isPresented = true
+        guard !isWorking, !isChecking else { return }
+        isChecking = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let state = FanHelperRegistration.authorizationState()
+            DispatchQueue.main.async {
+                self.isChecking = false
+                switch state {
+                case .enabled:
+                    self.phase = .enabled
+                    self.isPresented = false
+                case .notRegistered: self.phase = .notRegistered
+                case .needsUpdate: self.phase = .needsUpdate
+                case .requiresApproval: self.phase = .requiresApproval
+                case .checking: self.phase = .checking
+                case .unavailable(let message): self.phase = .failed(message)
                 }
-            }
-        case .requiresApproval:
-            phase = FanHelperRegistration.isCurrentBuildRegistered
-                ? .requiresApproval
-                : .needsUpdate
-            if presentWhenNeeded
-                && (phase == .needsUpdate
-                    || !FanHelperRegistration.wasOnboardingDismissedForCurrentBuild) {
-                isPresented = true
-            }
-        case .notRegistered, .notFound:
-            if case .failed = phase {
-                return
-            }
-            phase = .notRegistered
-            if presentWhenNeeded
-                && !FanHelperRegistration.wasOnboardingDismissedForCurrentBuild {
-                isPresented = true
-            }
-        @unknown default:
-            phase = .failed("无法识别当前 macOS 的后台服务授权状态。")
-            if presentWhenNeeded {
-                isPresented = true
+                if state != .enabled && presentWhenNeeded
+                    && !FanHelperRegistration.wasOnboardingDismissedForCurrentBuild {
+                    self.isPresented = true
+                }
             }
         }
     }
 
     func enableFullFunctionality() {
-        if phase == .requiresApproval {
-            refresh()
-            return
-        }
-
-        guard !isWorking else { return }
+        guard !isWorking, !isChecking else { return }
         isWorking = true
         phase = .checking
-
         DispatchQueue.global(qos: .userInitiated).async {
-            let result: Result<Void, Error>
-            do {
-                try FanHelperRegistration.registerOrRefresh()
-                result = .success(())
-            } catch {
-                result = .failure(error)
-            }
-
+            let result = Result { try FanHelperRegistration.registerOrRefresh() }
             DispatchQueue.main.async {
                 self.isWorking = false
                 switch result {
-                case .success:
-                    self.refresh()
+                case .success: self.refresh()
                 case .failure(let error):
                     self.phase = .failed(error.localizedDescription)
                     self.isPresented = true
@@ -235,9 +179,7 @@ final class FirstLaunchAuthorizationModel: ObservableObject {
         }
     }
 
-    func openSystemSettings() {
-        FanHelperRegistration.openSystemSettings()
-    }
+    func openSystemSettings() { FanHelperRegistration.openSystemSettings() }
 
     func dismissForNow() {
         FanHelperRegistration.dismissOnboardingForCurrentBuild()
@@ -276,7 +218,7 @@ struct FirstLaunchAuthorizationView: View {
                 )
                 permissionRow(
                     icon: "fanblades",
-                    text: "风扇写入由签名验证的系统服务完成，并限制在硬件安全范围内"
+                    text: "授权后由专用后台服务调速，始终限制在硬件安全范围内"
                 )
                 permissionRow(
                     icon: "key.fill",
@@ -353,15 +295,15 @@ struct FirstLaunchAuthorizationView: View {
     private var detail: String {
         switch model.phase {
         case .checking:
-            return "正在读取 macOS 后台服务状态。"
+            return "正在检查风扇服务是否已准备就绪。"
         case .notRegistered:
-            return "macOS 要求用户亲自批准 root 后台服务；应用不能静默代替你授权。"
+            return "点击下方按钮，在系统窗口输入管理员密码，软件会自动完成安装。以后正常使用和重启无需重复授权。"
         case .needsUpdate:
-            return "应用版本已更新。按 Apple 要求刷新 helper 注册，确保新签名和新路径生效。"
+            return "后台服务需要更新。批准后软件会自动完成更新，并保留已授权的用户。"
         case .requiresApproval:
             return "请在“系统设置 → 通用 → 登录项与扩展 → 允许在后台”中允许 Mac-TaskManager。完成后返回此处点击“重新检查”。"
         case .enabled:
-            return "授权已经完成，可以直接使用全部功能。"
+            return "设置已完成，可以使用手动调速和清凉模式。"
         case .failed(let message):
             return message
         }
@@ -376,7 +318,7 @@ struct FirstLaunchAuthorizationView: View {
         case .failed:
             return "重新尝试"
         default:
-            return "授权并启用"
+            return "启用完整功能"
         }
     }
 
