@@ -1,7 +1,6 @@
 import SwiftUI
 import AppKit
 import Foundation
-import QuartzCore
 import Darwin
 import MacSMC
 
@@ -1249,7 +1248,7 @@ enum AppTheme: String, CaseIterable {
             background = NSColor(srgbRed: 0.086, green: 0.114, blue: 0.149, alpha: 1)
         }
         // Do not apply the selected app theme to AppKit's transient windows
-        // (the status-item host and NSPopover). Those live in the Finder menu
+        // (the status-item host and floating panels). Those live in the Finder menu
         // bar and must retain the system appearance. Only the task-manager's
         // document window has a standard title style.
         for window in NSApp.windows where window.styleMask.contains(.titled) {
@@ -2504,7 +2503,7 @@ struct RunningApplicationsPopover: View {
     @AppStorage(AppTheme.preferenceKey) private var appTheme = AppTheme.system.rawValue
 
     private let popoverWidth: CGFloat = 338
-    private let popoverHeight: CGFloat = 480
+    var popoverHeight: CGFloat = 480
     private let actionWidth: CGFloat = 42
     private let memoryWidth: CGFloat = 100
     private let rowHeight: CGFloat = 42
@@ -4661,254 +4660,6 @@ struct VerticalRule: View {
 }
 
 // MARK: - App
-@MainActor
-final class MenuBarStatusController: NSObject, NSPopoverDelegate {
-    private static let itemWidth: CGFloat = 24
-
-    private let monitor: SystemMonitor
-    private let statusItem: NSStatusItem
-    private let popover: NSPopover
-    private var finishPopoverSlide: (() -> Void)?
-    private var popoverSlideToken: UUID?
-    private var isPopoverClosing = false
-    private var outsideClickMonitors: [Any] = []
-
-    init(monitor: SystemMonitor) {
-        self.monitor = monitor
-        self.statusItem = NSStatusBar.system.statusItem(withLength: Self.itemWidth)
-        self.popover = NSPopover()
-        super.init()
-
-        // Do not give this item an autosave name. On current macOS releases
-        // the menu-bar agent persists an item's placement under that identity;
-        // a restored hidden/overflow placement can then survive app updates.
-        // A regular status item should start in the visible system placement.
-        statusItem.isVisible = true
-        configureStatusButton()
-        configurePopover()
-    }
-
-    func invalidate() {
-        stopMonitoringOutsideClicks()
-        popover.close()
-        NSStatusBar.system.removeStatusItem(statusItem)
-    }
-
-    /// The menu-bar agent restores its layout asynchronously during launch.
-    /// Reapply visibility after that restoration so a newly installed app does
-    /// not inherit an off-menu/overflow placement from an earlier item.
-    func reassertVisibility() {
-        statusItem.isVisible = true
-    }
-
-    @objc private func togglePopover(_ sender: Any?) {
-        if isPopoverClosing {
-            slidePopover(opening: true)
-        } else if popover.isShown {
-            popover.performClose(nil)
-        } else {
-            showPopover()
-        }
-    }
-
-    private func configureStatusButton() {
-        guard let button = statusItem.button else { return }
-
-        // Do not let the app's selected window theme pin this item to a
-        // light/dark appearance. NSStatusBar owns the surrounding menu bar.
-        button.appearance = nil
-
-        let configuration = NSImage.SymbolConfiguration(
-            pointSize: 14,
-            weight: .medium,
-            scale: .medium
-        )
-        let image = NSImage(
-            systemSymbolName: "waveform.path.ecg",
-            accessibilityDescription: "正在运行的应用"
-        )?.withSymbolConfiguration(configuration)
-        image?.isTemplate = true
-
-        button.title = ""
-        button.image = image
-        button.imagePosition = .imageOnly
-        button.imageScaling = .scaleNone
-        button.toolTip = "正在运行的应用"
-
-        button.target = self
-        button.action = #selector(togglePopover(_:))
-    }
-
-    private func configurePopover() {
-        popover.behavior = .transient
-        popover.animates = false
-        popover.delegate = self
-        popover.contentSize = NSSize(width: 338, height: 480)
-        popover.contentViewController = NSHostingController(
-            rootView: RunningApplicationsPopover(monitor: monitor)
-        )
-    }
-
-    private func showPopover() {
-        guard let button = statusItem.button, !popover.isShown else { return }
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        configurePopoverWindowForFullScreenSpaces()
-        slidePopover(opening: true)
-        startMonitoringOutsideClicks()
-    }
-
-    private func startMonitoringOutsideClicks() {
-        stopMonitoringOutsideClicks()
-        let clicks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
-        if let local = NSEvent.addLocalMonitorForEvents(matching: clicks, handler: { [weak self] event in
-            let point = event.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
-            self?.closePopoverIfClickedOutside(at: point)
-            return event
-        }) {
-            outsideClickMonitors.append(local)
-        }
-        if let global = NSEvent.addGlobalMonitorForEvents(matching: clicks, handler: { [weak self] _ in
-            self?.closePopoverIfClickedOutside(at: NSEvent.mouseLocation)
-        }) {
-            outsideClickMonitors.append(global)
-        }
-    }
-
-    private func stopMonitoringOutsideClicks() {
-        outsideClickMonitors.forEach(NSEvent.removeMonitor)
-        outsideClickMonitors.removeAll()
-    }
-
-    private func closePopoverIfClickedOutside(at point: NSPoint) {
-        guard popover.isShown, !isPopoverClosing,
-              let window = popover.contentViewController?.view.window,
-              !window.frame.contains(point) else { return }
-        // The anchor button handles its own toggle; an outside-close here would reverse it.
-        if let button = statusItem.button, let statusWindow = button.window,
-           statusWindow.convertToScreen(button.convert(button.bounds, to: nil)).contains(point) {
-            return
-        }
-        popover.performClose(nil)
-    }
-
-    func popoverWillShow(_ notification: Notification) {
-        popover.contentViewController?.view.window?.alphaValue = 0
-    }
-
-    func popoverShouldClose(_ popover: NSPopover) -> Bool {
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return true }
-        if !isPopoverClosing { slidePopover(opening: false) }
-        return false
-    }
-
-    func popoverWillClose(_ notification: Notification) {
-        // Keep native teardown from exposing the restored surface or its shadow.
-        popover.contentViewController?.view.window?.alphaValue = 0
-    }
-
-    func popoverDidClose(_ notification: Notification) {
-        stopMonitoringOutsideClicks()
-        finishPopoverSlide?()
-        finishPopoverSlide = nil
-        isPopoverClosing = false
-    }
-
-    private func slidePopover(opening: Bool) {
-        defer {
-            if opening && popover.isShown {
-                popover.contentViewController?.view.window?.alphaValue = 1
-            }
-        }
-        guard let window = popover.contentViewController?.view.window,
-              let frameView = window.contentView?.superview else {
-            if !opening { popover.close() }
-            return
-        }
-        frameView.wantsLayer = true
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
-              let layer = frameView.layer, layer.bounds.height > 0 else {
-            if opening {
-                finishPopoverSlide?()
-                finishPopoverSlide = nil
-                isPopoverClosing = false
-            } else {
-                popover.close()
-            }
-            return
-        }
-
-        let hiddenTransform = CATransform3DMakeTranslation(
-            0, frameView.isFlipped ? -layer.bounds.height : layer.bounds.height, 0
-        )
-        let start = finishPopoverSlide == nil
-            ? (opening ? hiddenTransform : CATransform3DIdentity)
-            : (layer.presentation()?.transform ?? layer.transform)
-        finishPopoverSlide?()
-        isPopoverClosing = !opening
-
-        let animation = CABasicAnimation(keyPath: "transform")
-        animation.fromValue = NSValue(caTransform3D: start)
-        animation.toValue = NSValue(caTransform3D: opening ? CATransform3DIdentity : hiddenTransform)
-        animation.duration = opening ? 0.36 : 0.24
-        animation.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 0.8, 0.25, 1)
-        let hadShadow = window.hasShadow
-        let token = UUID()
-        popoverSlideToken = token
-        // Presentation-layer motion must not route clicks to a different, stationary row.
-        let interactionMonitor = NSEvent.addLocalMonitorForEvents(matching: [
-            .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
-            .otherMouseDown, .otherMouseUp, .scrollWheel
-        ]) { [weak window] event in
-            event.window === window ? nil : event
-        }
-        let finish = { [weak self, weak layer, weak window] in
-            guard let self, self.popoverSlideToken == token else { return }
-            self.popoverSlideToken = nil
-            if let interactionMonitor { NSEvent.removeMonitor(interactionMonitor) }
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            layer?.removeAnimation(forKey: "popoverDrawerSlide")
-            layer?.transform = CATransform3DIdentity
-            window?.hasShadow = hadShadow
-            CATransaction.commit()
-        }
-        finishPopoverSlide = finish
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        CATransaction.setCompletionBlock { [weak self] in
-            guard let self, self.popoverSlideToken == token else { return }
-            if opening {
-                finish()
-                self.finishPopoverSlide = nil
-            } else {
-                self.popover.close()
-            }
-        }
-        // Move the complete native surface behind the window's top clipping edge.
-        window.hasShadow = false
-        layer.transform = opening ? CATransform3DIdentity : hiddenTransform
-        layer.add(animation, forKey: "popoverDrawerSlide")
-        CATransaction.commit()
-    }
-
-    private func configurePopoverWindowForFullScreenSpaces() {
-        // NSPopover creates its window lazily when it is shown. Make that
-        // window auxiliary in full-screen Spaces so the status-item popover
-        // remains available while another app owns the primary full-screen
-        // window. Its normal transient behavior still dismisses it on an
-        // outside click.
-        DispatchQueue.main.async { [weak self] in
-            guard let window = self?.popover.contentViewController?.view.window else { return }
-            window.collectionBehavior = [
-                .canJoinAllSpaces,
-                .fullScreenAuxiliary,
-                .transient,
-                .ignoresCycle
-            ]
-        }
-    }
-}
-
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     static weak var shared: AppDelegate?
 
