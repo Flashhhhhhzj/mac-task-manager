@@ -18,7 +18,7 @@ if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za
     exit 1
 fi
 APP_VERSION="${RELEASE_VERSION%%-*}"
-APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-7}"
+APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-8}"
 
 build_app_bundle() {
     local target_arch="${1:-arm64}"

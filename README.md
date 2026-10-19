@@ -144,8 +144,8 @@ swift run -c release CoolModeAlgorithmChecks
 版本号统一保存在根目录 `VERSION`。每次发布前用同步脚本更新它；DMG 文件名和 App 内版本会从该文件读取。`APP_BUILD_NUMBER` 用于应用包的 `CFBundleVersion`。
 
 ```sh
-./scripts/sync-version.sh 1.0.0-beta.4
-APP_BUILD_NUMBER="7" ./build.sh dmg
+./scripts/sync-version.sh 1.0.0-beta.5
+APP_BUILD_NUMBER="8" ./build.sh dmg
 ```
 
 默认生成 arm64 和 x64 两个 DMG，也可以只打包指定架构：
@@ -155,7 +155,7 @@ APP_BUILD_NUMBER="7" ./build.sh dmg
 ./build.sh dmg x64
 ```
 
-脚本只生成带版本号和架构后缀的 DMG（例如 `Mac-TaskManager-v1.0.0-beta.4-arm64.dmg`），保留安装窗口布局检查，并重新挂载最终 DMG 校验 Helper 和完整 App。签名身份固定为 `-`（ad-hoc）：不读取钥匙串、不导入证书、不使用公司签名，也不执行公证或票据装订。旧的签名和公证环境变量不再参与构建。
+脚本只生成带版本号和架构后缀的 DMG（例如 `Mac-TaskManager-v1.0.0-beta.5-arm64.dmg`），保留安装窗口布局检查，并重新挂载最终 DMG 校验 Helper 和完整 App。签名身份固定为 `-`（ad-hoc）：不读取钥匙串、不导入证书、不使用公司签名，也不执行公证或票据装订。旧的签名和公证环境变量不再参与构建。
 
 单个可执行文件的链接器签名不能代替完整 App 的资源封装；脚本在资源与 Info.plist 就绪后，先为 Helper、再为整个 App 执行无证书的 [ad-hoc 签名](https://developer.apple.com/documentation/security/seccodesignatureflags/adhoc)，并严格校验。它保证包的完整性，不代表 Apple 已认可开发者或通过公证。未公证的下载包可能被 Gatekeeper 阻止，用户需在信任来源的前提下通过[“系统设置 → 隐私与安全性”允许打开](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac)。安装与运行流程不要求关闭 SIP 或全局关闭 Gatekeeper。
 

@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Foundation
+import QuartzCore
 import Darwin
 import MacSMC
 
@@ -1262,11 +1263,15 @@ enum AppTheme: String, CaseIterable {
     }
 }
 
+final class ProcessSelectionState: ObservableObject {
+    @Published var selectedPID: Int32?
+}
+
 final class ContentViewState: ObservableObject {
+    let processSelection = ProcessSelectionState()
     @Published var selectedNav = 0
     @Published var sidebarExpanded = false
     @Published var searchText = ""
-    @Published var selectedPID: Int32?
     @Published var showRunTaskDialog = false
     @Published var runTaskCommand = ""
     @Published var runTaskError = ""
@@ -1453,7 +1458,7 @@ struct AppLogoImage: View {
     }
 }
 
-struct ResourceSample {
+struct ResourceSample: Equatable {
     let cpuUsage: Double
     let gpuUsage: Double
     let memoryUsage: UInt64
@@ -1721,7 +1726,7 @@ struct ContentView: View {
                             monitoringLogs: monitoringLogs
                         )
                     } else if state.selectedNav == 0 {
-                        TaskManagerCommandBar(monitor: monitor, state: state)
+                        TaskManagerCommandBar(monitor: monitor, state: state, selection: state.processSelection)
                         TaskManagerProcessTable(monitor: monitor, state: state)
                     } else if state.selectedNav == NavigationIndex.fanControl {
                         FanControlPage(model: fanControl)
@@ -1796,7 +1801,7 @@ struct ContentView: View {
             Text(monitoringLogs.exportErrorMessage ?? "")
         }
         .onAppear {
-            state.selectedPID = nil
+            state.processSelection.selectedPID = nil
             AppTheme.applyToApplication(state.selectedAppTheme)
             if NSApp.isActive {
                 authorization.start()
@@ -1829,7 +1834,6 @@ private enum TaskManagerFocus {
 
 private extension Notification.Name {
     static let taskManagerClearSearchFocus = Notification.Name("TaskManagerClearSearchFocus")
-    static let taskManagerClosePopover = Notification.Name("TaskManagerClosePopover")
 }
 
 struct TaskManagerTitleBar: View {
@@ -2222,9 +2226,10 @@ struct PerformanceGlyph: Shape {
 struct TaskManagerCommandBar: View {
     @ObservedObject var monitor: SystemMonitor
     @ObservedObject var state: ContentViewState
+    @ObservedObject var selection: ProcessSelectionState
 
     var selectedProcess: AppProcess? {
-        guard let pid = state.selectedPID else { return nil }
+        guard let pid = selection.selectedPID else { return nil }
         return monitor.processes.first { $0.pid == pid }
     }
 
@@ -2332,7 +2337,7 @@ final class OverflowMenuActions: NSObject {
     }
 
     @objc func copyPID() {
-        guard let pid = state?.selectedPID else { return }
+        guard let pid = state?.processSelection.selectedPID else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(String(pid), forType: .string)
     }
@@ -2547,40 +2552,6 @@ struct RunningApplicationsPopover: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(TaskManagerStyle.surface)
-
-            Rectangle()
-                .fill(TaskManagerStyle.grid)
-                .frame(height: 1)
-
-            HStack {
-                Button(action: {
-                    NotificationCenter.default.post(name: .taskManagerClosePopover, object: nil)
-                    AppDelegate.shared?.showMainWindow()
-                }) {
-                    HStack(spacing: 5) {
-                        Image(systemName: "macwindow")
-                            .font(.system(size: 12))
-                        Text("打开任务管理器")
-                            .font(.system(size: 13, weight: .medium))
-                    }
-                    .foregroundColor(TaskManagerStyle.text)
-                }
-                .buttonStyle(.plain)
-
-                Spacer()
-
-                Button(action: {
-                    NSApp.terminate(nil)
-                }) {
-                    Text("退出")
-                        .font(.system(size: 13))
-                        .foregroundColor(TaskManagerStyle.muted)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 14)
-            .frame(height: 38)
-            .background(TaskManagerStyle.chrome)
         }
         .frame(width: popoverWidth, height: popoverHeight)
         .background(TaskManagerStyle.chrome)
@@ -4257,67 +4228,11 @@ struct TaskManagerProcessTable: View {
                 LazyVStack(spacing: 0) {
                     ProcessGroupHeader(title: "应用", count: tableData.appRootProcesses.count, nameWidth: nameWidth, actionWidth: actionWidth, metricWidth: metricWidth)
 
-                    ForEach(tableData.appProcessRows) { row in
-                        ProcessTableRow(
-                            process: row.process,
-                            level: row.level,
-                            hasChildren: row.hasChildren,
-                            childCount: row.childCount,
-                            isExpanded: row.isExpanded,
-                            selected: state.selectedPID == row.process.pid,
-                            nameWidth: nameWidth,
-                            actionWidth: actionWidth,
-                            metricWidth: metricWidth,
-                            sample: resourceSample(for: row.resources),
-                            terminationMode: state.terminationMode,
-                            onToggleExpanded: {
-                                toggleExpanded(row.process.pid)
-                            },
-                            onKillProcess: {
-                                monitor.killProcess(pid: row.process.pid, mode: state.terminationMode)
-                            }
-                        )
-                        .onTapGesture {
-                            state.selectedPID = row.process.pid
-                        }
-                        .onHover { hovering in
-                            if hovering, state.selectedPID != row.process.pid {
-                                state.selectedPID = row.process.pid
-                            }
-                        }
-                    }
+                    processRows(tableData.appProcessRows)
 
                     ProcessGroupHeader(title: "后台进程", count: tableData.backgroundRootProcesses.count, nameWidth: nameWidth, actionWidth: actionWidth, metricWidth: metricWidth)
 
-                    ForEach(tableData.backgroundProcessRows) { row in
-                        ProcessTableRow(
-                            process: row.process,
-                            level: row.level,
-                            hasChildren: row.hasChildren,
-                            childCount: row.childCount,
-                            isExpanded: row.isExpanded,
-                            selected: state.selectedPID == row.process.pid,
-                            nameWidth: nameWidth,
-                            actionWidth: actionWidth,
-                            metricWidth: metricWidth,
-                            sample: resourceSample(for: row.resources),
-                            terminationMode: state.terminationMode,
-                            onToggleExpanded: {
-                                toggleExpanded(row.process.pid)
-                            },
-                            onKillProcess: {
-                                monitor.killProcess(pid: row.process.pid, mode: state.terminationMode)
-                            }
-                        )
-                        .onTapGesture {
-                            state.selectedPID = row.process.pid
-                        }
-                        .onHover { hovering in
-                            if hovering, state.selectedPID != row.process.pid {
-                                state.selectedPID = row.process.pid
-                            }
-                        }
-                    }
+                    processRows(tableData.backgroundProcessRows)
                 }
                 .padding(.bottom, 20)
                 .frame(width: nameWidth + actionWidth + metricWidth * 5, alignment: .leading)
@@ -4343,13 +4258,16 @@ struct TaskManagerProcessTable: View {
         }
     }
 
-    func resourceSample(for resources: ProcessResourceValues) -> ResourceSample {
-        ResourceSample(
-            cpuUsage: resources.cpuUsage,
-            gpuUsage: resources.gpuUsage,
-            memoryUsage: resources.memoryUsage,
-            diskBytesPerSecond: resources.diskBytesPerSecond,
-            networkBytesPerSecond: resources.networkBytesPerSecond
+    private func processRows(_ rows: [ProcessTreeRow]) -> some View {
+        ProcessTableRows(
+            rows: rows,
+            selection: state.processSelection,
+            nameWidth: nameWidth,
+            actionWidth: actionWidth,
+            metricWidth: metricWidth,
+            terminationMode: state.terminationMode,
+            onToggleExpanded: toggleExpanded,
+            onKillProcess: { pid in monitor.killProcess(pid: pid, mode: state.terminationMode) }
         )
     }
 
@@ -4359,6 +4277,52 @@ struct TaskManagerProcessTable: View {
         } else {
             state.expandedProcessIDs.insert(pid)
         }
+    }
+}
+
+private struct ProcessTableRows: View {
+    let rows: [ProcessTreeRow]
+    @ObservedObject var selection: ProcessSelectionState
+    let nameWidth: CGFloat
+    let actionWidth: CGFloat
+    let metricWidth: CGFloat
+    let terminationMode: ProcessTerminationMode
+    let onToggleExpanded: (Int32) -> Void
+    let onKillProcess: (Int32) -> Void
+
+    var body: some View {
+        ForEach(rows) { row in
+            ProcessTableRow(
+                process: row.process,
+                level: row.level,
+                hasChildren: row.hasChildren,
+                childCount: row.childCount,
+                isExpanded: row.isExpanded,
+                selected: selection.selectedPID == row.process.pid,
+                nameWidth: nameWidth,
+                actionWidth: actionWidth,
+                metricWidth: metricWidth,
+                sample: ResourceSample(
+                    cpuUsage: row.resources.cpuUsage,
+                    gpuUsage: row.resources.gpuUsage,
+                    memoryUsage: row.resources.memoryUsage,
+                    diskBytesPerSecond: row.resources.diskBytesPerSecond,
+                    networkBytesPerSecond: row.resources.networkBytesPerSecond
+                ),
+                terminationMode: terminationMode,
+                onToggleExpanded: { onToggleExpanded(row.process.pid) },
+                onKillProcess: { onKillProcess(row.process.pid) }
+            )
+            .equatable()
+            .onTapGesture { select(row.process.pid) }
+            .onHover { hovering in
+                if hovering { select(row.process.pid) }
+            }
+        }
+    }
+
+    private func select(_ pid: Int32) {
+        if selection.selectedPID != pid { selection.selectedPID = pid }
     }
 }
 
@@ -4476,7 +4440,7 @@ struct ProcessGroupHeader: View {
     }
 }
 
-struct ProcessTableRow: View {
+struct ProcessTableRow: View, Equatable {
     let process: AppProcess
     let level: Int
     let hasChildren: Bool
@@ -4490,6 +4454,24 @@ struct ProcessTableRow: View {
     let terminationMode: ProcessTerminationMode
     let onToggleExpanded: () -> Void
     let onKillProcess: () -> Void
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        // Actions use the stable PID; only changed display inputs need a new body.
+        lhs.process.pid == rhs.process.pid
+            && lhs.process.name == rhs.process.name
+            && lhs.process.isApp == rhs.process.isApp
+            && lhs.process.icon === rhs.process.icon
+            && lhs.level == rhs.level
+            && lhs.hasChildren == rhs.hasChildren
+            && lhs.childCount == rhs.childCount
+            && lhs.isExpanded == rhs.isExpanded
+            && lhs.selected == rhs.selected
+            && lhs.nameWidth == rhs.nameWidth
+            && lhs.actionWidth == rhs.actionWidth
+            && lhs.metricWidth == rhs.metricWidth
+            && lhs.sample == rhs.sample
+            && lhs.terminationMode == rhs.terminationMode
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -4547,6 +4529,7 @@ struct ProcessTableRow: View {
             ResourceCell(text: formatDisk(sample.diskBytesPerSecond), width: metricWidth, intensity: diskIntensity(sample.diskBytesPerSecond))
             ResourceCell(text: formatNetwork(sample.networkBytesPerSecond), width: metricWidth, intensity: networkIntensity(sample.networkBytesPerSecond))
         }
+        .frame(height: 34)
         .contentShape(Rectangle())
     }
 
@@ -4679,12 +4662,16 @@ struct VerticalRule: View {
 
 // MARK: - App
 @MainActor
-final class MenuBarStatusController: NSObject {
+final class MenuBarStatusController: NSObject, NSPopoverDelegate {
     private static let itemWidth: CGFloat = 24
 
     private let monitor: SystemMonitor
     private let statusItem: NSStatusItem
     private let popover: NSPopover
+    private var finishPopoverSlide: (() -> Void)?
+    private var popoverSlideToken: UUID?
+    private var isPopoverClosing = false
+    private var outsideClickMonitors: [Any] = []
 
     init(monitor: SystemMonitor) {
         self.monitor = monitor
@@ -4699,24 +4686,12 @@ final class MenuBarStatusController: NSObject {
         statusItem.isVisible = true
         configureStatusButton()
         configurePopover()
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleClosePopoverNotification),
-            name: .taskManagerClosePopover,
-            object: nil
-        )
     }
 
     func invalidate() {
-        NotificationCenter.default.removeObserver(self, name: .taskManagerClosePopover, object: nil)
+        stopMonitoringOutsideClicks()
         popover.close()
         NSStatusBar.system.removeStatusItem(statusItem)
-    }
-
-    @objc private func handleClosePopoverNotification() {
-        if popover.isShown {
-            popover.performClose(nil)
-        }
     }
 
     /// The menu-bar agent restores its layout asynchronously during launch.
@@ -4727,7 +4702,9 @@ final class MenuBarStatusController: NSObject {
     }
 
     @objc private func togglePopover(_ sender: Any?) {
-        if popover.isShown {
+        if isPopoverClosing {
+            slidePopover(opening: true)
+        } else if popover.isShown {
             popover.performClose(nil)
         } else {
             showPopover()
@@ -4764,7 +4741,8 @@ final class MenuBarStatusController: NSObject {
 
     private func configurePopover() {
         popover.behavior = .transient
-        popover.animates = true
+        popover.animates = false
+        popover.delegate = self
         popover.contentSize = NSSize(width: 338, height: 480)
         popover.contentViewController = NSHostingController(
             rootView: RunningApplicationsPopover(monitor: monitor)
@@ -4775,6 +4753,142 @@ final class MenuBarStatusController: NSObject {
         guard let button = statusItem.button, !popover.isShown else { return }
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         configurePopoverWindowForFullScreenSpaces()
+        slidePopover(opening: true)
+        startMonitoringOutsideClicks()
+    }
+
+    private func startMonitoringOutsideClicks() {
+        stopMonitoringOutsideClicks()
+        let clicks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        if let local = NSEvent.addLocalMonitorForEvents(matching: clicks, handler: { [weak self] event in
+            let point = event.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
+            self?.closePopoverIfClickedOutside(at: point)
+            return event
+        }) {
+            outsideClickMonitors.append(local)
+        }
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: clicks, handler: { [weak self] _ in
+            self?.closePopoverIfClickedOutside(at: NSEvent.mouseLocation)
+        }) {
+            outsideClickMonitors.append(global)
+        }
+    }
+
+    private func stopMonitoringOutsideClicks() {
+        outsideClickMonitors.forEach(NSEvent.removeMonitor)
+        outsideClickMonitors.removeAll()
+    }
+
+    private func closePopoverIfClickedOutside(at point: NSPoint) {
+        guard popover.isShown, !isPopoverClosing,
+              let window = popover.contentViewController?.view.window,
+              !window.frame.contains(point) else { return }
+        // The anchor button handles its own toggle; an outside-close here would reverse it.
+        if let button = statusItem.button, let statusWindow = button.window,
+           statusWindow.convertToScreen(button.convert(button.bounds, to: nil)).contains(point) {
+            return
+        }
+        popover.performClose(nil)
+    }
+
+    func popoverWillShow(_ notification: Notification) {
+        popover.contentViewController?.view.window?.alphaValue = 0
+    }
+
+    func popoverShouldClose(_ popover: NSPopover) -> Bool {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return true }
+        if !isPopoverClosing { slidePopover(opening: false) }
+        return false
+    }
+
+    func popoverWillClose(_ notification: Notification) {
+        // Keep native teardown from exposing the restored surface or its shadow.
+        popover.contentViewController?.view.window?.alphaValue = 0
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        stopMonitoringOutsideClicks()
+        finishPopoverSlide?()
+        finishPopoverSlide = nil
+        isPopoverClosing = false
+    }
+
+    private func slidePopover(opening: Bool) {
+        defer {
+            if opening && popover.isShown {
+                popover.contentViewController?.view.window?.alphaValue = 1
+            }
+        }
+        guard let window = popover.contentViewController?.view.window,
+              let frameView = window.contentView?.superview else {
+            if !opening { popover.close() }
+            return
+        }
+        frameView.wantsLayer = true
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+              let layer = frameView.layer, layer.bounds.height > 0 else {
+            if opening {
+                finishPopoverSlide?()
+                finishPopoverSlide = nil
+                isPopoverClosing = false
+            } else {
+                popover.close()
+            }
+            return
+        }
+
+        let hiddenTransform = CATransform3DMakeTranslation(
+            0, frameView.isFlipped ? -layer.bounds.height : layer.bounds.height, 0
+        )
+        let start = finishPopoverSlide == nil
+            ? (opening ? hiddenTransform : CATransform3DIdentity)
+            : (layer.presentation()?.transform ?? layer.transform)
+        finishPopoverSlide?()
+        isPopoverClosing = !opening
+
+        let animation = CABasicAnimation(keyPath: "transform")
+        animation.fromValue = NSValue(caTransform3D: start)
+        animation.toValue = NSValue(caTransform3D: opening ? CATransform3DIdentity : hiddenTransform)
+        animation.duration = opening ? 0.36 : 0.24
+        animation.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 0.8, 0.25, 1)
+        let hadShadow = window.hasShadow
+        let token = UUID()
+        popoverSlideToken = token
+        // Presentation-layer motion must not route clicks to a different, stationary row.
+        let interactionMonitor = NSEvent.addLocalMonitorForEvents(matching: [
+            .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+            .otherMouseDown, .otherMouseUp, .scrollWheel
+        ]) { [weak window] event in
+            event.window === window ? nil : event
+        }
+        let finish = { [weak self, weak layer, weak window] in
+            guard let self, self.popoverSlideToken == token else { return }
+            self.popoverSlideToken = nil
+            if let interactionMonitor { NSEvent.removeMonitor(interactionMonitor) }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer?.removeAnimation(forKey: "popoverDrawerSlide")
+            layer?.transform = CATransform3DIdentity
+            window?.hasShadow = hadShadow
+            CATransaction.commit()
+        }
+        finishPopoverSlide = finish
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock { [weak self] in
+            guard let self, self.popoverSlideToken == token else { return }
+            if opening {
+                finish()
+                self.finishPopoverSlide = nil
+            } else {
+                self.popover.close()
+            }
+        }
+        // Move the complete native surface behind the window's top clipping edge.
+        window.hasShadow = false
+        layer.transform = opening ? CATransform3DIdentity : hiddenTransform
+        layer.add(animation, forKey: "popoverDrawerSlide")
+        CATransaction.commit()
     }
 
     private func configurePopoverWindowForFullScreenSpaces() {
