@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftUI
 
 enum FanHelperRegistration {
-    private static let onboardingDismissedBuildKey = "FanHelperOnboardingDismissedBuild"
+    private static let onboardingDismissedBuildKey = "FullFunctionalitySystemManagementV1DismissedBuild"
     private static let installationLock = NSLock()
     private static var helperURL: URL {
         Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/MacFanHelper")
@@ -140,7 +140,8 @@ final class FirstLaunchAuthorizationModel: ObservableObject {
         guard !isWorking, !isChecking else { return }
         isChecking = true
         DispatchQueue.global(qos: .userInitiated).async {
-            let state = FanHelperRegistration.authorizationState()
+            let fanState = FanHelperRegistration.authorizationState()
+            let state: FanHelperAuthorizationState = fanState == .enabled && !SystemManagementAuthorization.isEnabled ? .needsUpdate : fanState
             DispatchQueue.main.async {
                 self.isChecking = false
                 switch state {
@@ -166,7 +167,9 @@ final class FirstLaunchAuthorizationModel: ObservableObject {
         isWorking = true
         phase = .checking
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = Result { try FanHelperRegistration.registerOrRefresh() }
+            let result = Result {
+                try SystemManagementAuthorization.install(includeFan: !FanHelperRegistration.authorizationState(checkConnection: false).isEnabled)
+            }
             DispatchQueue.main.async {
                 self.isWorking = false
                 switch result {
@@ -218,7 +221,7 @@ struct FirstLaunchAuthorizationView: View {
                 )
                 permissionRow(
                     icon: "fanblades",
-                    text: "授权后由专用后台服务调速，始终限制在硬件安全范围内"
+                    text: "授权后可调节风扇，并管理第三方系统启动项与服务"
                 )
                 permissionRow(
                     icon: "key.fill",
@@ -280,30 +283,30 @@ struct FirstLaunchAuthorizationView: View {
         case .checking:
             return "正在检查完整功能"
         case .notRegistered:
-            return "启用完整的风扇控制"
+            return "启用风扇与系统管理"
         case .needsUpdate:
-            return "更新风扇控制服务"
+            return "更新完整功能授权"
         case .requiresApproval:
             return "还需要一次系统批准"
         case .enabled:
             return "完整功能已启用"
         case .failed:
-            return "风扇控制服务配置失败"
+            return "完整功能配置失败"
         }
     }
 
     private var detail: String {
         switch model.phase {
         case .checking:
-            return "正在检查风扇服务是否已准备就绪。"
+            return "正在检查风扇和系统管理服务。"
         case .notRegistered:
             return "点击下方按钮，在系统窗口输入管理员密码，软件会自动完成安装。以后正常使用和重启无需重复授权。"
         case .needsUpdate:
-            return "后台服务需要更新。批准后软件会自动完成更新，并保留已授权的用户。"
+            return "后台服务需要更新或增加系统管理权限。批准后，当前账户可管理第三方系统服务；已有风扇服务无需重复安装。"
         case .requiresApproval:
             return "请在“系统设置 → 通用 → 登录项与扩展 → 允许在后台”中允许 Mac-TaskManager。完成后返回此处点击“重新检查”。"
         case .enabled:
-            return "设置已完成，可以使用手动调速和清凉模式。"
+            return "设置已完成，可以使用手动调速、清凉模式及第三方系统服务管理。"
         case .failed(let message):
             return message
         }

@@ -888,7 +888,7 @@ struct FanControlPage: View {
     private var pageHeader: some View {
         HStack(spacing: 12) {
             Text("风扇控制")
-                .font(.system(size: 20, weight: .semibold))
+                .font(.system(size: TaskManagerStyle.pageTitleFontSize, weight: .semibold))
                 .foregroundColor(TaskManagerStyle.text)
 
             if model.busyFanIndex != nil || model.isRegisteringHelper {
@@ -950,7 +950,7 @@ struct FanControlPage: View {
             .disabled(model.busyFanIndex != nil)
         }
         .padding(.horizontal, 20)
-        .frame(height: 63)
+        .frame(height: TaskManagerStyle.pageToolbarHeight)
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(TaskManagerStyle.grid)

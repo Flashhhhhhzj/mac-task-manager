@@ -1,34 +1,11 @@
 import SwiftUI
 import AppKit
 import Foundation
-import QuartzCore
 import Darwin
 import MacSMC
+import MacManagement
 
 // MARK: - Models
-enum ProcessStatus {
-    case none
-    case efficiency
-    case suspended
-}
-
-struct AppProcess: Identifiable {
-    var id: Int32 { pid }
-    let pid: Int32
-    let parentPID: Int32
-    let runningSeconds: TimeInterval?
-    let name: String
-    let cpuUsage: Double
-    let gpuUsage: Double
-    let memoryUsage: UInt64
-    let diskBytesPerSecond: Double
-    let networkBytesPerSecond: Double
-    let user: String
-    let icon: NSImage?
-    let isApp: Bool
-    let status: ProcessStatus
-}
-
 struct CPUCore: Identifiable {
     let id: Int
     let usage: Double
@@ -107,6 +84,8 @@ class SystemMonitor: ObservableObject {
     @Published var wifiThroughputHistory: [Double] = []
     @Published var gpuHistory: [Double] = []
     private(set) var processVersion = 0
+    let appHistory: AppHistoryStore
+    private let metadataCollector = ProcessMetadataCollector()
 
     private var timer: Timer?
     private let refreshQueue = DispatchQueue(label: "Mac-TaskManager.refresh", qos: .background)
@@ -117,6 +96,8 @@ class SystemMonitor: ObservableObject {
     private var previousGPUTotals: [Int32: UInt64] = [:]
     private var previousNetworkTotals: [Int32: (received: UInt64, sent: UInt64)] = [:]
     private var networkRates: [Int32: Double] = [:]
+    private var publishedNetworkTotals: [Int32: (received: UInt64, sent: UInt64)] = [:]
+    private var publishedNetworkTime = Date.distantPast
     private var isNetworkSampling = false
     private var previousProcessSampleTime: Date?
     private var previousGPUSampleTime: Date?
@@ -127,8 +108,9 @@ class SystemMonitor: ObservableObject {
     private let performanceHistoryLimit = 30
     private let monitoringLogs: MonitoringLogRecorder
 
-    init(monitoringLogs: MonitoringLogRecorder) {
+    init(monitoringLogs: MonitoringLogRecorder, appHistory: AppHistoryStore = AppHistoryStore()) {
         self.monitoringLogs = monitoringLogs
+        self.appHistory = appHistory
         startMonitoring()
         loadHardwareInfo()
     }
@@ -506,7 +488,7 @@ class SystemMonitor: ObservableObject {
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
-        task.arguments = ["-axo", "pid=,ppid=,etime=,pcpu=,rss=,user=,command="]
+        task.arguments = ["-axo", "pid=,ppid=,etime=,pcpu=,rss=,uid=,user=,stat=,command="]
 
         let pipe = Pipe()
         task.standardOutput = pipe
@@ -543,25 +525,28 @@ class SystemMonitor: ObservableObject {
 
             let components = trimmed.split(
                 separator: " ",
-                maxSplits: 6,
+                maxSplits: 8,
                 omittingEmptySubsequences: true
             )
-            guard components.count >= 7 else { continue }
+            guard components.count >= 9 else { continue }
 
             guard let pid = Int32(components[0]),
                   let parentPID = Int32(components[1]),
                   let cpu = Double(components[3]),
-                  let rss = UInt64(components[4]) else { continue }
+                  let rss = UInt64(components[4]), let uid = UInt32(components[5]) else { continue }
 
             currentProcessIDs.insert(pid)
             let runningSeconds = processRunningSeconds(String(components[2]))
-            let user = String(components[5])
+            let user = String(components[6])
             let normalizedCPU = min(cpu / Double(processorCount), 100)
             let gpuUsage = gpuSample.processUsage[pid] ?? 0
-            let command = String(components[6])
+            let command = String(components[8])
             let matchedApp = appMap[pid]
             let appIcon = icon(for: pid, app: matchedApp)
-            let isApp = appIcon != nil && isApplicationProcess(command: command, app: matchedApp)
+            let isApp = isApplicationProcess(
+                activationPolicy: matchedApp?.activationPolicy,
+                bundleURL: matchedApp?.bundleURL
+            )
             let name = displayName(pid: pid, command: command, app: matchedApp, isApp: isApp)
             let icon: NSImage? = appIcon ?? fallbackProcessIcon
             let diskTotal = diskBytes(for: pid)
@@ -579,11 +564,18 @@ class SystemMonitor: ObservableObject {
             }
             totalDiskReadRate += diskReadBytesPerSecond
             totalDiskWriteRate += diskWriteBytesPerSecond
-            currentDiskTotals[pid] = diskTotal
+            currentDiskTotals[pid] = (diskTotal.read, diskTotal.write)
             let networkBytesPerSecond = networkRate(for: pid)
 
             guard !name.isEmpty else { continue }
 
+            var metadata = metadataCollector.read(pid: pid, uid: uid, state: String(components[7]), cpuNanoseconds: diskTotal.cpu, app: matchedApp)
+            networkLock.lock()
+            if let identity = metadata.identity, publishedNetworkTime >= identity.startDate {
+                metadata.receivedBytes = publishedNetworkTotals[pid]?.received
+                metadata.sentBytes = publishedNetworkTotals[pid]?.sent
+            }
+            networkLock.unlock()
             processes.append(AppProcess(
                 pid: pid,
                 parentPID: parentPID,
@@ -597,10 +589,12 @@ class SystemMonitor: ObservableObject {
                 user: user,
                 icon: icon,
                 isApp: isApp,
-                status: .none
+                status: .none,
+                metadata: metadata
             ))
         }
 
+        metadataCollector.retain(processes)
         previousDiskTotals = currentDiskTotals
         previousProcessSampleTime = sampleTime
         appIconCache = appIconCache.filter { currentProcessIDs.contains($0.key) }
@@ -617,6 +611,7 @@ class SystemMonitor: ObservableObject {
             self.appendHistory(min(totalDiskRate / 1_048_576, 100), to: &self.diskTransferHistory)
             self.appendHistory(gpuSample.totalUsage, to: &self.gpuHistory)
             self.processes = sortedProcesses
+            self.appHistory.record(sortedProcesses)
         }
     }
 
@@ -664,25 +659,6 @@ class SystemMonitor: ObservableObject {
         guard let icon = app?.icon else { return nil }
         appIconCache[pid] = icon
         return icon
-    }
-
-    private func isApplicationProcess(command: String, app: NSRunningApplication?) -> Bool {
-        if app?.activationPolicy == .regular {
-            return true
-        }
-        if let bundlePath = app?.bundleURL?.path, isApplicationsBundlePath(bundlePath) {
-            return true
-        }
-        return isApplicationsBundlePath(command)
-    }
-
-    private func isApplicationsBundlePath(_ path: String) -> Bool {
-        let normalizedPath = (path.replacingOccurrences(of: "\\ ", with: " ") as NSString).standardizingPath
-        let components = normalizedPath.split(separator: "/").map(String.init)
-        guard let appComponentIndex = components.firstIndex(where: { $0.hasSuffix(".app") }) else {
-            return false
-        }
-        return components[..<appComponentIndex].contains("Applications")
     }
 
     private func sortProcessesByMemory(_ processes: [AppProcess]) -> [AppProcess] {
@@ -846,15 +822,15 @@ class SystemMonitor: ObservableObject {
         return lastPathComponent.isEmpty ? executable : lastPathComponent
     }
 
-    private func diskBytes(for pid: Int32) -> (read: UInt64, write: UInt64) {
+    private func diskBytes(for pid: Int32) -> (read: UInt64, write: UInt64, cpu: UInt64?) {
         var info = rusage_info_v4()
         let result = withUnsafeMutablePointer(to: &info) { pointer in
             pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rebound in
                 proc_pid_rusage(pid, RUSAGE_INFO_V4, rebound)
             }
         }
-        guard result == 0 else { return (0, 0) }
-        return (info.ri_diskio_bytesread, info.ri_diskio_byteswritten)
+        guard result == 0 else { return (0, 0, nil) }
+        return (info.ri_diskio_bytesread, info.ri_diskio_byteswritten, info.ri_user_time &+ info.ri_system_time)
     }
 
     private func networkRate(for pid: Int32) -> Double {
@@ -883,6 +859,10 @@ class SystemMonitor: ObservableObject {
     private func updateNetworkRates() {
         let totals = networkBytesByPID()
         let sampleTime = Date()
+        networkLock.lock()
+        publishedNetworkTotals = totals
+        publishedNetworkTime = sampleTime
+        networkLock.unlock()
         guard let previousSampleTime = previousNetworkSampleTime else {
             previousNetworkTotals = totals
             previousNetworkSampleTime = sampleTime
@@ -918,34 +898,8 @@ class SystemMonitor: ObservableObject {
     }
 
     private func networkBytesByPID() -> [Int32: (received: UInt64, sent: UInt64)] {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
-        task.arguments = ["-P", "-L", "1", "-x", "-J", "bytes_in,bytes_out"]
-
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-
-        let finished = DispatchSemaphore(value: 0)
-        task.terminationHandler = { _ in
-            finished.signal()
-        }
-
-        do {
-            try task.run()
-        } catch {
-            return [:]
-        }
-
-        if finished.wait(timeout: .now() + 2.5) == .timedOut {
-            task.terminate()
-            if finished.wait(timeout: .now() + 0.5) == .timedOut {
-                kill(task.processIdentifier, SIGKILL)
-            }
-        }
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(decoding: data, as: UTF8.self)
+        // DNS resolution can stall the entire snapshot even in process-only mode.
+        guard let output = try? ManagementCommand.run("/usr/bin/nettop", ["-P", "-L", "1", "-n", "-x", "-J", "bytes_in,bytes_out"], timeout: 4) else { return [:] }
         var totals: [Int32: (received: UInt64, sent: UInt64)] = [:]
 
         for line in output.components(separatedBy: "\n").dropFirst() {
@@ -1118,12 +1072,14 @@ class SystemMonitor: ObservableObject {
         }
     }
 
-    func killProcess(pid: Int32, mode: ProcessTerminationMode) {
-        guard kill(pid, mode.signal) == 0 else { return }
+    @discardableResult
+    func killProcess(pid: Int32, mode: ProcessTerminationMode) -> Bool {
+        guard kill(pid, mode.signal) == 0 else { return false }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             self.updateData()
         }
+        return true
     }
 
     func launchTask(command: String) -> Bool {
@@ -1249,7 +1205,7 @@ enum AppTheme: String, CaseIterable {
             background = NSColor(srgbRed: 0.086, green: 0.114, blue: 0.149, alpha: 1)
         }
         // Do not apply the selected app theme to AppKit's transient windows
-        // (the status-item host and NSPopover). Those live in the Finder menu
+        // (the status-item host and floating panels). Those live in the Finder menu
         // bar and must retain the system appearance. Only the task-manager's
         // document window has a standard title style.
         for window in NSApp.windows where window.styleMask.contains(.titled) {
@@ -1269,14 +1225,21 @@ final class ProcessSelectionState: ObservableObject {
 
 final class ContentViewState: ObservableObject {
     let processSelection = ProcessSelectionState()
-    @Published var selectedNav = 0
+    @Published var selectedPage = TaskManagerPage(rawValue: UserDefaults.standard.string(forKey: "DefaultStartPage") ?? "") ?? .processes
+    let management = ManagementWorkspace()
     @Published var sidebarExpanded = false
-    @Published var searchText = ""
+    @Published private var pageSearches: [TaskManagerPage: String] = [:]
+    var searchText: String {
+        get { pageSearches[selectedPage] ?? "" }
+        set { pageSearches[selectedPage] = newValue }
+    }
     @Published var showRunTaskDialog = false
     @Published var runTaskCommand = ""
     @Published var runTaskError = ""
     @Published var efficiencyPIDs: Set<Int32> = []
     @Published var frozenProcessOrder: [Int32]?
+    @Published var processSort = ProcessSort()
+    @Published var groupProcessesByType = true
     @Published var expandedProcessIDs: Set<Int32> = []
     @Published var selectedPerformanceIndex = 0
     @Published var appTheme = AppTheme.current.rawValue {
@@ -1286,7 +1249,9 @@ final class ContentViewState: ObservableObject {
             AppTheme.applyToApplication(theme)
         }
     }
-    @Published var defaultStartPage = "进程"
+    @Published var defaultStartPage = UserDefaults.standard.string(forKey: "DefaultStartPage") ?? "进程" {
+        didSet { UserDefaults.standard.set(defaultStartPage, forKey: "DefaultStartPage") }
+    }
     @Published var updateSpeed = "常规"
     @Published var launchAtLoginEnabled = AppRuntimePreferences.isLaunchAtLoginEnabled {
         didSet {
@@ -1328,11 +1293,18 @@ final class ContentViewState: ObservableObject {
         AppTheme(rawValue: appTheme) ?? .system
     }
 
+    func sortProcesses(by column: ProcessSortColumn) {
+        frozenProcessOrder = nil
+        processSort.select(column)
+    }
+
     func processTableData(processes: [AppProcess], processVersion: Int) -> ProcessTableData {
         let normalizedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = ProcessTableCacheKey(
             processVersion: processVersion,
             searchText: normalizedSearch,
+            sort: processSort,
+            groupByType: groupProcessesByType,
             frozenProcessOrder: frozenProcessOrder,
             expandedProcessIDs: expandedProcessIDs.sorted()
         )
@@ -1345,7 +1317,9 @@ final class ContentViewState: ObservableObject {
             processes: processes,
             searchText: normalizedSearch,
             frozenProcessOrder: frozenProcessOrder,
-            expandedProcessIDs: expandedProcessIDs
+            expandedProcessIDs: expandedProcessIDs,
+            sort: processSort,
+            groupByType: groupProcessesByType
         )
         processTableCacheKey = key
         processTableCache = tableData
@@ -1353,12 +1327,17 @@ final class ContentViewState: ObservableObject {
     }
 }
 
-enum NavigationIndex {
-    static let settings = -1
-    static let fanControl = 2
-}
-
 enum TaskManagerStyle {
+    static let pageTitleFontSize: CGFloat = 20
+    static let pageToolbarHeight: CGFloat = 63
+    static let tableBodyFontSize: CGFloat = 15
+    static let tableHeaderFontSize: CGFloat = 14
+    static let tableSummaryFontSize: CGFloat = 22
+    static let tableRowHeight: CGFloat = 34
+    static let tableHeaderHeight: CGFloat = 64
+    static let tableIconSize: CGFloat = 18
+    static let tableNameWidth: CGFloat = 292
+    static let tableMetricWidth: CGFloat = 91
     static let contentWidth: CGFloat = 1097
     static let contentHeight: CGFloat = 726
     static let minContentWidth: CGFloat = 1097
@@ -1375,6 +1354,7 @@ enum TaskManagerStyle {
     static let grid = adaptive(light: 0.914, 0.914, 0.914, dark: 0.180, 0.180, 0.180)
     static let chromeRule = adaptive(light: 0.886, 0.898, 0.918, dark: 0.157, 0.157, 0.157)
     static let headerCell = adaptive(light: 0.965, 0.965, 0.965, dark: 0.125, 0.125, 0.125)
+    static let selectedHeader = adaptive(light: 0.965, 0.965, 0.965, dark: 0.200, 0.200, 0.200)
     static let resource = adaptive(light: 0.839, 0.945, 1.000, dark: 0.047, 0.145, 0.259)
     static let resourceHot = adaptive(light: 0.612, 0.867, 1.000, dark: 0.064, 0.220, 0.412)
     static let selectedRow = adaptive(light: 0.972, 0.972, 0.972, dark: 0.185, 0.185, 0.185)
@@ -1466,242 +1446,6 @@ struct ResourceSample: Equatable {
     let networkBytesPerSecond: Double
 }
 
-struct ProcessResourceValues {
-    var cpuUsage: Double
-    var gpuUsage: Double
-    var memoryUsage: UInt64
-    var diskBytesPerSecond: Double
-    var networkBytesPerSecond: Double
-
-    static func from(_ process: AppProcess) -> ProcessResourceValues {
-        ProcessResourceValues(
-            cpuUsage: process.cpuUsage,
-            gpuUsage: process.gpuUsage,
-            memoryUsage: process.memoryUsage,
-            diskBytesPerSecond: process.diskBytesPerSecond,
-            networkBytesPerSecond: process.networkBytesPerSecond
-        )
-    }
-
-    mutating func add(_ values: ProcessResourceValues) {
-        cpuUsage += values.cpuUsage
-        gpuUsage += values.gpuUsage
-        memoryUsage += values.memoryUsage
-        diskBytesPerSecond += values.diskBytesPerSecond
-        networkBytesPerSecond += values.networkBytesPerSecond
-    }
-}
-
-struct ProcessTreeRow: Identifiable {
-    var id: Int32 { process.pid }
-    let process: AppProcess
-    let resources: ProcessResourceValues
-    let level: Int
-    let hasChildren: Bool
-    let childCount: Int
-    let isExpanded: Bool
-}
-
-struct ProcessTableData {
-    let filteredProcesses: [AppProcess]
-    let appRootProcesses: [AppProcess]
-    let backgroundRootProcesses: [AppProcess]
-    let appProcessRows: [ProcessTreeRow]
-    let backgroundProcessRows: [ProcessTreeRow]
-
-    static func make(
-        processes: [AppProcess],
-        searchText: String,
-        frozenProcessOrder: [Int32]?,
-        expandedProcessIDs: Set<Int32>
-    ) -> ProcessTableData {
-        let matchingProcesses = processes.filter { process in
-            searchText.isEmpty ||
-                process.name.localizedCaseInsensitiveContains(searchText) ||
-                process.user.localizedCaseInsensitiveContains(searchText) ||
-                String(process.pid).contains(searchText)
-        }
-        let normallySorted = normallySortedProcesses(matchingProcesses)
-        let filteredProcesses = frozenSortedProcesses(normallySorted, frozenProcessOrder: frozenProcessOrder)
-        let visiblePIDs = Set(filteredProcesses.map(\.pid))
-        let childrenByParent = Dictionary(
-            grouping: filteredProcesses.filter { $0.parentPID > 1 && visiblePIDs.contains($0.parentPID) },
-            by: \.parentPID
-        )
-        let rootProcesses = filteredProcesses.filter { $0.parentPID <= 1 || !visiblePIDs.contains($0.parentPID) }
-        let appRootProcesses = rootProcesses.filter { $0.isApp }
-        let backgroundRootProcesses = rootProcesses.filter { !$0.isApp }
-        let resourcesByPID = aggregateResourcesByPID(
-            processes: filteredProcesses,
-            childrenByParent: childrenByParent
-        )
-
-        return ProcessTableData(
-            filteredProcesses: filteredProcesses,
-            appRootProcesses: appRootProcesses,
-            backgroundRootProcesses: backgroundRootProcesses,
-            appProcessRows: visibleRows(
-                for: appRootProcesses,
-                childrenByParent: childrenByParent,
-                resourcesByPID: resourcesByPID,
-                expandedProcessIDs: expandedProcessIDs
-            ),
-            backgroundProcessRows: visibleRows(
-                for: backgroundRootProcesses,
-                childrenByParent: childrenByParent,
-                resourcesByPID: resourcesByPID,
-                expandedProcessIDs: expandedProcessIDs
-            )
-        )
-    }
-
-    private static func normallySortedProcesses(_ processes: [AppProcess]) -> [AppProcess] {
-        processes.sorted {
-            if $0.isApp != $1.isApp { return $0.isApp && !$1.isApp }
-            if $0.memoryUsage != $1.memoryUsage { return $0.memoryUsage > $1.memoryUsage }
-            if $0.cpuUsage != $1.cpuUsage { return $0.cpuUsage > $1.cpuUsage }
-            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-        }
-    }
-
-    private static func frozenSortedProcesses(
-        _ normallySorted: [AppProcess],
-        frozenProcessOrder: [Int32]?
-    ) -> [AppProcess] {
-        guard let frozenProcessOrder else { return normallySorted }
-
-        let frozenRank = Dictionary(uniqueKeysWithValues: frozenProcessOrder.enumerated().map { ($0.element, $0.offset) })
-        let normalRank = Dictionary(uniqueKeysWithValues: normallySorted.enumerated().map { ($0.element.pid, $0.offset) })
-        return normallySorted.sorted {
-            let leftFrozenRank = frozenRank[$0.pid] ?? Int.max
-            let rightFrozenRank = frozenRank[$1.pid] ?? Int.max
-            if leftFrozenRank != rightFrozenRank {
-                return leftFrozenRank < rightFrozenRank
-            }
-            return (normalRank[$0.pid] ?? Int.max) < (normalRank[$1.pid] ?? Int.max)
-        }
-    }
-
-    private static func visibleRows(
-        for roots: [AppProcess],
-        childrenByParent: [Int32: [AppProcess]],
-        resourcesByPID: [Int32: ProcessResourceValues],
-        expandedProcessIDs: Set<Int32>
-    ) -> [ProcessTreeRow] {
-        var rows: [ProcessTreeRow] = []
-        var visitedPIDs = Set<Int32>()
-        for process in roots {
-            appendVisibleRows(
-                for: process,
-                level: 0,
-                childrenByParent: childrenByParent,
-                resourcesByPID: resourcesByPID,
-                expandedProcessIDs: expandedProcessIDs,
-                visitedPIDs: &visitedPIDs,
-                rows: &rows
-            )
-        }
-        return rows
-    }
-
-    private static func appendVisibleRows(
-        for process: AppProcess,
-        level: Int,
-        childrenByParent: [Int32: [AppProcess]],
-        resourcesByPID: [Int32: ProcessResourceValues],
-        expandedProcessIDs: Set<Int32>,
-        visitedPIDs: inout Set<Int32>,
-        rows: inout [ProcessTreeRow]
-    ) {
-        guard !visitedPIDs.contains(process.pid) else { return }
-        visitedPIDs.insert(process.pid)
-
-        let children = childrenByParent[process.pid] ?? []
-        let isExpanded = expandedProcessIDs.contains(process.pid)
-        rows.append(ProcessTreeRow(
-            process: process,
-            resources: resourcesByPID[process.pid] ?? .from(process),
-            level: level,
-            hasChildren: !children.isEmpty,
-            childCount: children.count,
-            isExpanded: isExpanded
-        ))
-
-        guard isExpanded else { return }
-        for child in children {
-            appendVisibleRows(
-                for: child,
-                level: level + 1,
-                childrenByParent: childrenByParent,
-                resourcesByPID: resourcesByPID,
-                expandedProcessIDs: expandedProcessIDs,
-                visitedPIDs: &visitedPIDs,
-                rows: &rows
-            )
-        }
-    }
-
-    private static func aggregateResourcesByPID(
-        processes: [AppProcess],
-        childrenByParent: [Int32: [AppProcess]]
-    ) -> [Int32: ProcessResourceValues] {
-        let processesByPID = Dictionary(uniqueKeysWithValues: processes.map { ($0.pid, $0) })
-        var memo: [Int32: ProcessResourceValues] = [:]
-        var visiting = Set<Int32>()
-
-        for process in processes {
-            _ = aggregateResources(
-                for: process.pid,
-                processesByPID: processesByPID,
-                childrenByParent: childrenByParent,
-                visiting: &visiting,
-                memo: &memo
-            )
-        }
-        return memo
-    }
-
-    private static func aggregateResources(
-        for pid: Int32,
-        processesByPID: [Int32: AppProcess],
-        childrenByParent: [Int32: [AppProcess]],
-        visiting: inout Set<Int32>,
-        memo: inout [Int32: ProcessResourceValues]
-    ) -> ProcessResourceValues {
-        if let cached = memo[pid] {
-            return cached
-        }
-        guard let process = processesByPID[pid] else {
-            return ProcessResourceValues(cpuUsage: 0, gpuUsage: 0, memoryUsage: 0, diskBytesPerSecond: 0, networkBytesPerSecond: 0)
-        }
-        guard !visiting.contains(pid) else {
-            return .from(process)
-        }
-
-        visiting.insert(pid)
-        var total = ProcessResourceValues.from(process)
-        for child in childrenByParent[pid] ?? [] {
-            total.add(aggregateResources(
-                for: child.pid,
-                processesByPID: processesByPID,
-                childrenByParent: childrenByParent,
-                visiting: &visiting,
-                memo: &memo
-            ))
-        }
-        visiting.remove(pid)
-        memo[pid] = total
-        return total
-    }
-}
-
-struct ProcessTableCacheKey: Equatable {
-    let processVersion: Int
-    let searchText: String
-    let frozenProcessOrder: [Int32]?
-    let expandedProcessIDs: [Int32]
-}
-
 // MARK: - Views
 struct ContentView: View {
     @ObservedObject var monitor: SystemMonitor
@@ -1718,20 +1462,20 @@ struct ContentView: View {
                 TaskManagerSidebar(state: state)
 
                 VStack(spacing: 0) {
-                    if state.selectedNav == NavigationIndex.settings {
+                    if state.selectedPage == .settings {
                         SettingsPage(
                             monitor: monitor,
                             state: state,
                             fanControl: fanControl,
                             monitoringLogs: monitoringLogs
                         )
-                    } else if state.selectedNav == 0 {
+                    } else if state.selectedPage == .processes {
                         TaskManagerCommandBar(monitor: monitor, state: state, selection: state.processSelection)
                         TaskManagerProcessTable(monitor: monitor, state: state)
-                    } else if state.selectedNav == NavigationIndex.fanControl {
+                    } else if state.selectedPage == .fans {
                         FanControlPage(model: fanControl)
                     } else {
-                        TaskManagerSecondaryPage(index: state.selectedNav, monitor: monitor, state: state)
+                        TaskManagerSecondaryPage(page: state.selectedPage, monitor: monitor, state: state)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -1815,6 +1559,9 @@ struct ContentView: View {
         .onChange(of: authorization.isPresented) { isPresented in
             if isPresented {
                 TaskManagerFocus.clearSearchFocus()
+            } else {
+                state.management.refreshAuthorization()
+                state.management.refresh(page: state.selectedPage, force: true)
             }
         }
         .onChange(of: state.appTheme) { _ in
@@ -1827,7 +1574,7 @@ private enum TaskManagerFocus {
     static func clearSearchFocus() {
         NotificationCenter.default.post(name: .taskManagerClearSearchFocus, object: nil)
         DispatchQueue.main.async {
-            NSApp.keyWindow?.makeFirstResponder(nil)
+            if !(NSApp.keyWindow?.firstResponder is NSTableView) { NSApp.keyWindow?.makeFirstResponder(nil) }
         }
     }
 }
@@ -1854,7 +1601,7 @@ struct TaskManagerTitleBar: View {
                 .frame(width: 272, alignment: .leading)
                 .padding(.leading, 22)
 
-                if state.selectedNav == 0 {
+                if state.selectedPage.searchable {
                     HStack(spacing: 12) {
                         Image(systemName: "magnifyingglass")
                             .font(.system(size: 15))
@@ -1960,25 +1707,6 @@ struct WindowControlButton: View {
 struct TaskManagerSidebar: View {
     @ObservedObject var state: ContentViewState
 
-    let icons = [
-        "square.grid.2x2",
-        "waveform.path.ecg",
-        "fanblades",
-        "speedometer",
-        "person.2",
-        "list.bullet",
-        "puzzlepiece.extension"
-    ]
-    let labels = [
-        "进程",
-        "性能",
-        "风扇控制",
-        "启动应用",
-        "用户",
-        "详细信息",
-        "服务"
-    ]
-
     var sidebarWidth: CGFloat {
         state.sidebarExpanded ? 190 : 62
     }
@@ -1990,30 +1718,25 @@ struct TaskManagerSidebar: View {
             }
                 .padding(.top, 7)
 
-            ForEach(Array(icons.enumerated()), id: \.offset) { item in
-                let enabled = item.offset <= NavigationIndex.fanControl
-                SidebarButton(
-                    icon: item.element,
-                    label: labels[item.offset],
-                    expanded: state.sidebarExpanded,
-                    selected: enabled && state.selectedNav == item.offset,
-                    enabled: enabled
-                ) {
-                    if enabled {
-                        state.selectedNav = item.offset
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: 8) {
+                    ForEach(TaskManagerPage.navigationPages) { page in
+                        SidebarButton(icon: page.icon, label: page.rawValue, expanded: state.sidebarExpanded,
+                                      selected: state.selectedPage == page, enabled: true) {
+                            state.selectedPage = page
+                        }
                     }
                 }
             }
-
-            Spacer()
+            .frame(maxHeight: .infinity, alignment: .top)
 
             SidebarButton(
                 icon: "gearshape",
                 label: "设置",
                 expanded: state.sidebarExpanded,
-                selected: state.selectedNav == NavigationIndex.settings
+                selected: state.selectedPage == .settings
             ) {
-                state.selectedNav = NavigationIndex.settings
+                state.selectedPage = .settings
             }
                 .padding(.bottom, 14)
         }
@@ -2048,6 +1771,7 @@ struct SidebarToggleButton: View {
             }
         }
         .buttonStyle(.plain)
+        .accessibilityLabel("导航")
         .frame(width: expanded ? 176 : 50, height: 42, alignment: .leading)
         .onHover { hovering in
             hover.isHovered = hovering
@@ -2091,6 +1815,7 @@ struct SidebarButton: View {
             .frame(width: expanded ? 176 : 50, height: 42, alignment: .leading)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(label)
         .disabled(!enabled)
         .frame(width: expanded ? 176 : 50, height: 42, alignment: .leading)
         .onHover { hovering in
@@ -2240,7 +1965,7 @@ struct TaskManagerCommandBar: View {
     var body: some View {
         HStack(spacing: 0) {
             Text("进程")
-                .font(.system(size: 20, weight: .semibold))
+                .font(.system(size: TaskManagerStyle.pageTitleFontSize, weight: .semibold))
                 .foregroundColor(TaskManagerStyle.text)
                 .padding(.leading, 20)
 
@@ -2269,17 +1994,12 @@ struct TaskManagerCommandBar: View {
                 }
             }
 
-            Button(action: showOverflowMenu) {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 19, weight: .semibold))
-                    .frame(width: 48, height: 40)
-                    .foregroundColor(TaskManagerStyle.text)
-            }
-            .buttonStyle(.plain)
+            ProcessOverflowMenuButton(monitor: monitor, state: state, selectedProcess: selectedProcess)
+            .frame(width: 48, height: 40)
             .padding(.trailing, 8)
         }
         .frame(maxWidth: .infinity)
-        .frame(height: 63)
+        .frame(height: TaskManagerStyle.pageToolbarHeight)
         .background(TaskManagerStyle.surface)
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -2309,43 +2029,6 @@ struct TaskManagerCommandBar: View {
         alert.alertStyle = .warning
         alert.addButton(withTitle: "确定")
         alert.runModal()
-    }
-
-    func showOverflowMenu() {
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "刷新", action: #selector(OverflowMenuActions.refresh), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "复制 PID", action: #selector(OverflowMenuActions.copyPID), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "复制进程名", action: #selector(OverflowMenuActions.copyName), keyEquivalent: ""))
-        OverflowMenuActions.shared.monitor = monitor
-        OverflowMenuActions.shared.state = state
-        OverflowMenuActions.shared.selectedProcess = selectedProcess
-        for item in menu.items {
-            item.target = OverflowMenuActions.shared
-        }
-        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
-    }
-}
-
-final class OverflowMenuActions: NSObject {
-    static let shared = OverflowMenuActions()
-    weak var monitor: SystemMonitor?
-    weak var state: ContentViewState?
-    var selectedProcess: AppProcess?
-
-    @objc func refresh() {
-        monitor?.updateData()
-    }
-
-    @objc func copyPID() {
-        guard let pid = state?.processSelection.selectedPID else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(String(pid), forType: .string)
-    }
-
-    @objc func copyName() {
-        guard let name = selectedProcess?.name else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(name, forType: .string)
     }
 
 }
@@ -2504,51 +2187,42 @@ struct RunningApplicationsPopover: View {
     @AppStorage(AppTheme.preferenceKey) private var appTheme = AppTheme.system.rawValue
 
     private let popoverWidth: CGFloat = 338
-    private let popoverHeight: CGFloat = 480
+    var popoverHeight: CGFloat = 480
     private let actionWidth: CGFloat = 42
     private let memoryWidth: CGFloat = 100
     private let rowHeight: CGFloat = 42
-    private let scrollRailWidth: CGFloat = 8
-
-    private var tableWidth: CGFloat {
-        popoverWidth - scrollRailWidth
-    }
-
     private var nameWidth: CGFloat {
-        tableWidth - actionWidth - memoryWidth
+        popoverWidth - actionWidth - memoryWidth
     }
 
     private var selectedAppTheme: AppTheme {
         AppTheme(rawValue: appTheme) ?? .system
     }
 
-    private var appProcesses: [AppProcess] {
-        monitor.processes
-            .filter(\.isApp)
-            .sorted {
-                if $0.memoryUsage != $1.memoryUsage { return $0.memoryUsage > $1.memoryUsage }
-                if $0.cpuUsage != $1.cpuUsage { return $0.cpuUsage > $1.cpuUsage }
-                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-            }
-    }
-
     var body: some View {
-        VStack(spacing: 0) {
+        let appRows = ProcessTableData.make(
+            processes: monitor.processes,
+            searchText: "",
+            frozenProcessOrder: nil,
+            expandedProcessIDs: []
+        ).appProcessRows
+
+        return VStack(spacing: 0) {
             columnHeader
 
             ScrollView(.vertical, showsIndicators: true) {
                 LazyVStack(spacing: 0) {
-                    if appProcesses.isEmpty {
+                    if appRows.isEmpty {
                         emptyState
                     } else {
-                        ForEach(appProcesses) { process in
-                            popoverRow(process)
+                        ForEach(appRows) { row in
+                            popoverRow(row)
                         }
                     }
                 }
                 .padding(.bottom, 10)
                 .background(OverlayAutoHidingScroller())
-                .frame(width: tableWidth, alignment: .leading)
+                .frame(width: popoverWidth, alignment: .leading)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(TaskManagerStyle.surface)
@@ -2558,7 +2232,7 @@ struct RunningApplicationsPopover: View {
         .preferredColorScheme(selectedAppTheme.preferredColorScheme)
         .onAppear {
             monitor.updateData()
-            if let selectedPID = popoverState.selectedPID, !appProcesses.contains(where: { $0.pid == selectedPID }) {
+            if let selectedPID = popoverState.selectedPID, !appRows.contains(where: { $0.id == selectedPID }) {
                 popoverState.selectedPID = nil
             }
         }
@@ -2570,7 +2244,7 @@ struct RunningApplicationsPopover: View {
             headerCell("", width: actionWidth, alignment: .center)
             headerCell("内存", width: memoryWidth, alignment: .center)
         }
-        .frame(width: tableWidth, alignment: .leading)
+        .frame(width: popoverWidth, alignment: .leading)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(TaskManagerStyle.headerCell)
         .overlay(alignment: .bottom) {
@@ -2597,7 +2271,8 @@ struct RunningApplicationsPopover: View {
         .background(TaskManagerStyle.surface)
     }
 
-    private func popoverRow(_ process: AppProcess) -> some View {
+    private func popoverRow(_ row: ProcessTreeRow) -> some View {
+        let process = row.process
         let selected = popoverState.selectedPID == process.pid
 
         return HStack(spacing: 0) {
@@ -2636,7 +2311,7 @@ struct RunningApplicationsPopover: View {
                 VerticalRule()
             }
 
-            resourceText(formatMemory(process.memoryUsage), width: memoryWidth, intensity: memoryIntensity(process.memoryUsage))
+            resourceText(formatMemory(row.resources.memoryUsage), width: memoryWidth, intensity: memoryIntensity(row.resources.memoryUsage))
                 .background(selected ? TaskManagerStyle.selectedSidebar : Color.clear)
         }
         .contentShape(Rectangle())
@@ -2712,130 +2387,32 @@ struct AppInitialsIcon: View {
 }
 
 struct TaskManagerSecondaryPage: View {
-    let index: Int
+    let page: TaskManagerPage
     @ObservedObject var monitor: SystemMonitor
     @ObservedObject var state: ContentViewState
 
-    let titles = [
-        "进程",
-        "性能",
-        "应用历史记录",
-        "启动应用",
-        "用户",
-        "详细信息",
-        "服务"
-    ]
-
-    var title: String {
-        titles.indices.contains(index) ? titles[index] : "进程"
-    }
-
-    var memoryPercent: Double {
-        guard monitor.totalMemory > 0 else { return 0 }
-        return Double(monitor.usedMemory) / Double(monitor.totalMemory) * 100
-    }
-
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                Text(title)
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundColor(TaskManagerStyle.text)
-                    .padding(.leading, 20)
-                Spacer()
-                if index == 1 {
-                    CommandButton(icon: "macwindow.badge.plus", title: "运行新任务", enabled: true) {
-                        state.showRunTaskDialog = true
-                    }
+        if page == .performance {
+            VStack(spacing: 0) {
+                HStack(spacing: 0) {
+                    Text(page.rawValue).font(.system(size: TaskManagerStyle.pageTitleFontSize, weight: .semibold)).foregroundColor(TaskManagerStyle.text).padding(.leading, 20)
+                    Spacer()
+                    CommandButton(icon: "macwindow.badge.plus", title: "运行新任务", enabled: true) { state.showRunTaskDialog = true }
                     CommandSeparator()
-                    Button(action: {}) {
-                        Image(systemName: "ellipsis")
-                            .font(.system(size: 19, weight: .semibold))
-                            .frame(width: 48, height: 40)
-                            .foregroundColor(TaskManagerStyle.text)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.trailing, 8)
-                }
-            }
-            .frame(maxWidth: .infinity)
-            .frame(height: 63)
-            .background(TaskManagerStyle.surface)
-            .overlay(alignment: .bottom) {
-                Rectangle()
-                    .fill(TaskManagerStyle.grid)
-                    .frame(height: 1)
-            }
-
-            if index == 1 {
+                    TaskManagerOverflowMenuButton {
+                        let menu = NSMenu()
+                        menu.font = .systemFont(ofSize: TaskManagerStyle.tableHeaderFontSize)
+                        menu.minimumWidth = 190
+                        menu.addItem(TaskManagerMenuItem("刷新", action: monitor.updateData))
+                        return menu
+                    }.frame(width: 48, height: 40).padding(.trailing, 8)
+                }.frame(height: TaskManagerStyle.pageToolbarHeight).background(TaskManagerStyle.surface)
+                    .overlay(alignment: .bottom) { Rectangle().fill(TaskManagerStyle.grid).frame(height: 1) }
                 PerformancePage(monitor: monitor, state: state)
-            } else if index == 2 {
-                SimpleDataTable(columns: ["名称", "CPU", "内存"], rows: appRows)
-            } else if index == 3 {
-                SimpleDataTable(columns: ["名称", "状态", "影响"], rows: startupRows)
-            } else if index == 4 {
-                SimpleDataTable(columns: ["用户", "进程数", "内存"], rows: userRows)
-            } else if index == 5 {
-                SimpleDataTable(columns: ["名称", "PID", "用户", "CPU", "内存"], rows: detailRows)
-            } else if index == 6 {
-                SimpleDataTable(columns: ["名称", "PID", "端口", "协议"], rows: serviceRows)
-            } else {
-                Text("\(title) 页面")
-                    .font(.system(size: 16))
-                    .foregroundColor(TaskManagerStyle.muted)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             }
+        } else {
+            ManagementPage(page: page, monitor: monitor, state: state, workspace: state.management).id(page)
         }
-        .background(TaskManagerStyle.surface)
-    }
-
-    var appRows: [[String]] {
-        monitor.processes
-            .filter { $0.isApp }
-            .sorted { $0.name < $1.name }
-            .map { [$0.name, formatCPU($0.cpuUsage), formatMemory($0.memoryUsage)] }
-    }
-
-    var startupRows: [[String]] {
-        monitor.processes
-            .filter { $0.isApp }
-            .sorted { $0.name < $1.name }
-            .map { [$0.name, "可用", $0.cpuUsage > 2 ? "高" : "低"] }
-    }
-
-    var userRows: [[String]] {
-        let groups = Dictionary(grouping: monitor.processes, by: { $0.user })
-        return groups.keys.sorted().map { user in
-            let items = groups[user] ?? []
-            let memory = items.reduce(UInt64(0)) { $0 + $1.memoryUsage }
-            return [user, "\(items.count)", formatMemory(memory)]
-        }
-    }
-
-    var detailRows: [[String]] {
-        monitor.processes
-            .sorted { $0.cpuUsage > $1.cpuUsage }
-            .map { [$0.name, "\($0.pid)", $0.user, formatCPU($0.cpuUsage), formatMemory($0.memoryUsage)] }
-    }
-
-    var serviceRows: [[String]] {
-        monitor.ports.map { [$0.process, $0.pid, $0.port, $0.proto] }
-    }
-
-    func formatCPU(_ value: Double) -> String {
-        value < 0.05 ? "0%" : String(format: "%.1f%%", value)
-    }
-
-    func formatGPU(_ value: Double) -> String {
-        value < 0.05 ? "0%" : String(format: "%.1f%%", value)
-    }
-
-    func formatMemory(_ bytes: UInt64) -> String {
-        let mb = Double(bytes) / 1_048_576
-        if mb >= 1024 {
-            return String(format: "%.1f GB", mb / 1024)
-        }
-        return String(format: "%.1f MB", mb)
     }
 }
 
@@ -3658,7 +3235,7 @@ struct SettingsPage: View {
                 ) {
                     SettingsDropdown(
                         selection: $state.defaultStartPage,
-                        options: ["进程", "性能", "应用历史记录", "启动应用", "用户", "详细信息", "服务"],
+                        options: TaskManagerPage.navigationPages.map(\.rawValue),
                         identifier: "default-start-page",
                         dropdownCoordinator: dropdownCoordinator
                     )
@@ -3771,6 +3348,10 @@ struct SettingsPage: View {
                 }
                 .padding(.bottom, 12)
                 .zIndex(dropdownCoordinator.expandedIdentifier == "termination-mode" ? 10 : 0)
+
+                SettingsSectionTitle("系统管理")
+                SystemManagementSettings(workspace: state.management)
+                    .padding(.bottom, 12)
 
                 SettingsSectionTitle("散热")
                 SettingsOptionRow(
@@ -4133,63 +3714,13 @@ private extension View {
     }
 }
 
-struct SimpleDataTable: View {
-    let columns: [String]
-    let rows: [[String]]
-
-    var body: some View {
-        ScrollView {
-            LazyVStack(spacing: 0) {
-                HStack(spacing: 0) {
-                    ForEach(columns, id: \.self) { column in
-                        Text(column)
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundColor(TaskManagerStyle.muted)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 12)
-                            .frame(height: 40)
-                            .overlay(alignment: .trailing) {
-                                VerticalRule()
-                            }
-                    }
-                }
-                .overlay(alignment: .bottom) {
-                    Rectangle()
-                        .fill(TaskManagerStyle.grid)
-                        .frame(height: 1)
-                }
-
-                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                    HStack(spacing: 0) {
-                        ForEach(Array(row.enumerated()), id: \.offset) { _, value in
-                            Text(value)
-                                .font(.system(size: 14))
-                                .foregroundColor(TaskManagerStyle.text)
-                                .lineLimit(1)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 12)
-                                .frame(height: 32)
-                                .overlay(alignment: .trailing) {
-                                    VerticalRule()
-                                }
-                        }
-                    }
-                }
-            }
-        }
-        .padding(.horizontal, 18)
-        .padding(.top, 12)
-        .background(TaskManagerStyle.surface)
-    }
-}
-
 struct TaskManagerProcessTable: View {
     @ObservedObject var monitor: SystemMonitor
     @ObservedObject var state: ContentViewState
 
-    let nameWidth: CGFloat = 292
+    let nameWidth: CGFloat = TaskManagerStyle.tableNameWidth
     let actionWidth: CGFloat = 150
-    let metricWidth: CGFloat = 91
+    let metricWidth: CGFloat = TaskManagerStyle.tableMetricWidth
 
     var memoryPercent: Double {
         guard monitor.totalMemory > 0 else { return 0 }
@@ -4221,18 +3752,26 @@ struct TaskManagerProcessTable: View {
                 gpu: monitor.totalGPU,
                 memory: memoryPercent,
                 disk: diskPercent,
-                network: networkPercent
+                network: networkPercent,
+                sort: state.processSort,
+                onSort: state.sortProcesses
             )
 
             ScrollView(.vertical, showsIndicators: true) {
                 LazyVStack(spacing: 0) {
-                    ProcessGroupHeader(title: "应用", count: tableData.appRootProcesses.count, nameWidth: nameWidth, actionWidth: actionWidth, metricWidth: metricWidth)
+                    if state.groupProcessesByType {
+                        ProcessGroupHeader(title: "应用", count: tableData.appRootProcesses.count, nameWidth: nameWidth, actionWidth: actionWidth, metricWidth: metricWidth)
+                            .help("macOS 标记的普通应用，以及独立运行的菜单栏应用。隐藏或最小化的应用仍在此组；括号内为分组数。")
 
-                    processRows(tableData.appProcessRows)
+                        processRows(tableData.appProcessRows)
 
-                    ProcessGroupHeader(title: "后台进程", count: tableData.backgroundRootProcesses.count, nameWidth: nameWidth, actionWidth: actionWidth, metricWidth: metricWidth)
+                        ProcessGroupHeader(title: "后台进程", count: tableData.backgroundRootProcesses.count, nameWidth: nameWidth, actionWidth: actionWidth, metricWidth: metricWidth)
+                            .help("系统服务、辅助进程、扩展与 Widget。应用的子进程在对应应用下展开查看；括号内为分组数。")
 
-                    processRows(tableData.backgroundProcessRows)
+                        processRows(tableData.backgroundProcessRows)
+                    } else {
+                        processRows(tableData.allProcessRows)
+                    }
                 }
                 .padding(.bottom, 20)
                 .frame(width: nameWidth + actionWidth + metricWidth * 5, alignment: .leading)
@@ -4335,70 +3874,94 @@ struct TableHeader: View {
     let memory: Double
     let disk: Double
     let network: Double
+    let sort: ProcessSort
+    let onSort: (ProcessSortColumn) -> Void
 
     var body: some View {
         HStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 22) {
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 11, weight: .medium))
-                    .offset(x: -15, y: -8)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                Text("名称")
-                    .font(.system(size: 14))
-                    .foregroundColor(TaskManagerStyle.muted)
-                    .offset(y: -7)
-            }
-            .padding(.leading, 18)
-            .frame(width: nameWidth, height: 64, alignment: .bottomLeading)
-            .background(TaskManagerStyle.headerCell)
-            .overlay(alignment: .trailing) {
-                VerticalRule()
-            }
+            column(.name, width: nameWidth)
 
             Text("操作")
-                .font(.system(size: 14))
+                .font(.system(size: TaskManagerStyle.tableHeaderFontSize))
                 .foregroundColor(TaskManagerStyle.muted)
                 .offset(y: -7)
                 .padding(.leading, 8)
-                .frame(width: actionWidth, height: 64, alignment: .bottomLeading)
-                .background(TaskManagerStyle.headerCell)
-                .overlay(alignment: .trailing) {
-                    VerticalRule()
-                }
+                .frame(width: actionWidth, height: TaskManagerStyle.tableHeaderHeight, alignment: .bottomLeading)
+                .background(TaskManagerStyle.surface)
+                .overlay(alignment: .trailing) { VerticalRule() }
 
-            MetricHeader(value: String(format: "%.0f%%", cpu), title: "CPU", width: metricWidth)
-            MetricHeader(value: String(format: "%.0f%%", gpu), title: "GPU", width: metricWidth)
-            MetricHeader(value: String(format: "%.0f%%", memory), title: "内存", width: metricWidth)
-            MetricHeader(value: String(format: "%.0f%%", disk), title: "磁盘", width: metricWidth)
-            MetricHeader(value: String(format: "%.0f%%", network), title: "网络", width: metricWidth)
+            column(.cpu, value: cpu, width: metricWidth)
+            column(.gpu, value: gpu, width: metricWidth)
+            column(.memory, value: memory, width: metricWidth)
+            column(.disk, value: disk, width: metricWidth)
+            column(.network, value: network, width: metricWidth)
         }
-        .frame(height: 64)
+        .frame(height: TaskManagerStyle.tableHeaderHeight)
         .background(TaskManagerStyle.surface)
         .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(TaskManagerStyle.grid)
-                .frame(height: 1)
+            Rectangle().fill(TaskManagerStyle.grid).frame(height: 1)
         }
+    }
+
+    private func column(_ column: ProcessSortColumn, value: Double? = nil, width: CGFloat) -> some View {
+        SortableProcessHeader(column: column, value: value.map { String(format: "%.0f%%", $0) },
+                              width: width, sort: sort, onSort: onSort)
     }
 }
 
-struct MetricHeader: View {
-    let value: String
-    let title: String
+struct SortableProcessHeader: View {
+    let column: ProcessSortColumn
+    let value: String?
     let width: CGFloat
+    let sort: ProcessSort
+    let onSort: (ProcessSortColumn) -> Void
+
+    private var isSelected: Bool { sort.column == column }
+    private var sortValue: String { isSelected ? sort.directionLabel : "未选择" }
+    private var helpText: String {
+        isSelected ? "\(column.rawValue)：\(sort.directionLabel)；点击反向排序" : "点击按\(column.rawValue)排序"
+    }
 
     var body: some View {
-        VStack(spacing: 5) {
-            Text(value)
-                .font(.system(size: 22, weight: .regular))
-                .foregroundColor(TaskManagerStyle.text)
-            Text(title)
-                .font(.system(size: 14))
+        Button { onSort(column) } label: { headerLabel }
+            .buttonStyle(.plain)
+            .overlay(alignment: .trailing) { VerticalRule() }
+            .accessibilityLabel(Text("\(column.rawValue)排序"))
+            .accessibilityValue(Text(sortValue))
+            .help(Text(helpText))
+    }
+
+    private var headerLabel: some View {
+        headerText
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: column == .name ? .bottomLeading : .bottom)
+            .padding(.leading, column == .name ? 18 : 0)
+            .padding(.bottom, 7)
+            .frame(width: width, height: TaskManagerStyle.tableHeaderHeight)
+            .background(isSelected ? TaskManagerStyle.selectedHeader : TaskManagerStyle.surface)
+            .overlay(alignment: .top) { sortIndicator }
+            .contentShape(Rectangle())
+    }
+
+    private var headerText: some View {
+        VStack(spacing: 3) {
+            if let value {
+                Text(value)
+                    .font(.system(size: TaskManagerStyle.tableSummaryFontSize, weight: .regular))
+                    .foregroundColor(TaskManagerStyle.text)
+            }
+            Text(column.rawValue)
+                .font(.system(size: TaskManagerStyle.tableHeaderFontSize))
                 .foregroundColor(TaskManagerStyle.muted)
         }
-        .frame(width: width, height: 64, alignment: .center)
-        .overlay(alignment: .trailing) {
-            VerticalRule()
+    }
+
+    @ViewBuilder private var sortIndicator: some View {
+        if isSelected {
+            Image(systemName: sort.arrowSymbol)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(TaskManagerStyle.muted)
+                .padding(.top, 2)
+                .accessibilityHidden(true)
         }
     }
 }
@@ -4495,7 +4058,7 @@ struct ProcessTableRow: View, Equatable {
                 if let icon = process.icon {
                     Image(nsImage: icon)
                         .resizable()
-                        .frame(width: 18, height: 18)
+                        .frame(width: TaskManagerStyle.tableIconSize, height: TaskManagerStyle.tableIconSize)
                 } else {
                     Image(systemName: "app")
                         .font(.system(size: 17))
@@ -4504,20 +4067,20 @@ struct ProcessTableRow: View, Equatable {
                 }
 
                 Text(rowTitle)
-                    .font(.system(size: 15))
+                    .font(.system(size: TaskManagerStyle.tableBodyFontSize))
                     .foregroundColor(TaskManagerStyle.text)
                     .lineLimit(1)
             }
             .offset(y: 2)
             .padding(.leading, 22 + CGFloat(level) * 22)
-            .frame(width: nameWidth, height: 34, alignment: .leading)
+            .frame(width: nameWidth, height: TaskManagerStyle.tableRowHeight, alignment: .leading)
             .background(selected ? TaskManagerStyle.selectedRow : TaskManagerStyle.surface)
             .overlay(alignment: .trailing) {
                 VerticalRule()
             }
 
             KillProcessButton(title: terminationMode.rawValue, action: onKillProcess)
-                .frame(width: actionWidth, height: 34)
+                .frame(width: actionWidth, height: TaskManagerStyle.tableRowHeight)
             .background(selected ? TaskManagerStyle.selectedRow : TaskManagerStyle.surface)
             .overlay(alignment: .trailing) {
                 VerticalRule()
@@ -4529,7 +4092,7 @@ struct ProcessTableRow: View, Equatable {
             ResourceCell(text: formatDisk(sample.diskBytesPerSecond), width: metricWidth, intensity: diskIntensity(sample.diskBytesPerSecond))
             ResourceCell(text: formatNetwork(sample.networkBytesPerSecond), width: metricWidth, intensity: networkIntensity(sample.networkBytesPerSecond))
         }
-        .frame(height: 34)
+        .frame(height: TaskManagerStyle.tableRowHeight)
         .contentShape(Rectangle())
     }
 
@@ -4628,11 +4191,11 @@ struct ResourceCell: View {
 
     var body: some View {
         Text(text)
-            .font(.system(size: 15))
+            .font(.system(size: TaskManagerStyle.tableBodyFontSize))
             .foregroundColor(TaskManagerStyle.text)
             .lineLimit(1)
             .offset(y: 2)
-            .frame(width: width - 14, height: 34, alignment: .trailing)
+            .frame(width: width - 14, height: TaskManagerStyle.tableRowHeight, alignment: .trailing)
             .padding(.trailing, 14)
             .background(resourceColor)
             .overlay(alignment: .trailing) {
@@ -4661,254 +4224,6 @@ struct VerticalRule: View {
 }
 
 // MARK: - App
-@MainActor
-final class MenuBarStatusController: NSObject, NSPopoverDelegate {
-    private static let itemWidth: CGFloat = 24
-
-    private let monitor: SystemMonitor
-    private let statusItem: NSStatusItem
-    private let popover: NSPopover
-    private var finishPopoverSlide: (() -> Void)?
-    private var popoverSlideToken: UUID?
-    private var isPopoverClosing = false
-    private var outsideClickMonitors: [Any] = []
-
-    init(monitor: SystemMonitor) {
-        self.monitor = monitor
-        self.statusItem = NSStatusBar.system.statusItem(withLength: Self.itemWidth)
-        self.popover = NSPopover()
-        super.init()
-
-        // Do not give this item an autosave name. On current macOS releases
-        // the menu-bar agent persists an item's placement under that identity;
-        // a restored hidden/overflow placement can then survive app updates.
-        // A regular status item should start in the visible system placement.
-        statusItem.isVisible = true
-        configureStatusButton()
-        configurePopover()
-    }
-
-    func invalidate() {
-        stopMonitoringOutsideClicks()
-        popover.close()
-        NSStatusBar.system.removeStatusItem(statusItem)
-    }
-
-    /// The menu-bar agent restores its layout asynchronously during launch.
-    /// Reapply visibility after that restoration so a newly installed app does
-    /// not inherit an off-menu/overflow placement from an earlier item.
-    func reassertVisibility() {
-        statusItem.isVisible = true
-    }
-
-    @objc private func togglePopover(_ sender: Any?) {
-        if isPopoverClosing {
-            slidePopover(opening: true)
-        } else if popover.isShown {
-            popover.performClose(nil)
-        } else {
-            showPopover()
-        }
-    }
-
-    private func configureStatusButton() {
-        guard let button = statusItem.button else { return }
-
-        // Do not let the app's selected window theme pin this item to a
-        // light/dark appearance. NSStatusBar owns the surrounding menu bar.
-        button.appearance = nil
-
-        let configuration = NSImage.SymbolConfiguration(
-            pointSize: 14,
-            weight: .medium,
-            scale: .medium
-        )
-        let image = NSImage(
-            systemSymbolName: "waveform.path.ecg",
-            accessibilityDescription: "正在运行的应用"
-        )?.withSymbolConfiguration(configuration)
-        image?.isTemplate = true
-
-        button.title = ""
-        button.image = image
-        button.imagePosition = .imageOnly
-        button.imageScaling = .scaleNone
-        button.toolTip = "正在运行的应用"
-
-        button.target = self
-        button.action = #selector(togglePopover(_:))
-    }
-
-    private func configurePopover() {
-        popover.behavior = .transient
-        popover.animates = false
-        popover.delegate = self
-        popover.contentSize = NSSize(width: 338, height: 480)
-        popover.contentViewController = NSHostingController(
-            rootView: RunningApplicationsPopover(monitor: monitor)
-        )
-    }
-
-    private func showPopover() {
-        guard let button = statusItem.button, !popover.isShown else { return }
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        configurePopoverWindowForFullScreenSpaces()
-        slidePopover(opening: true)
-        startMonitoringOutsideClicks()
-    }
-
-    private func startMonitoringOutsideClicks() {
-        stopMonitoringOutsideClicks()
-        let clicks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
-        if let local = NSEvent.addLocalMonitorForEvents(matching: clicks, handler: { [weak self] event in
-            let point = event.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
-            self?.closePopoverIfClickedOutside(at: point)
-            return event
-        }) {
-            outsideClickMonitors.append(local)
-        }
-        if let global = NSEvent.addGlobalMonitorForEvents(matching: clicks, handler: { [weak self] _ in
-            self?.closePopoverIfClickedOutside(at: NSEvent.mouseLocation)
-        }) {
-            outsideClickMonitors.append(global)
-        }
-    }
-
-    private func stopMonitoringOutsideClicks() {
-        outsideClickMonitors.forEach(NSEvent.removeMonitor)
-        outsideClickMonitors.removeAll()
-    }
-
-    private func closePopoverIfClickedOutside(at point: NSPoint) {
-        guard popover.isShown, !isPopoverClosing,
-              let window = popover.contentViewController?.view.window,
-              !window.frame.contains(point) else { return }
-        // The anchor button handles its own toggle; an outside-close here would reverse it.
-        if let button = statusItem.button, let statusWindow = button.window,
-           statusWindow.convertToScreen(button.convert(button.bounds, to: nil)).contains(point) {
-            return
-        }
-        popover.performClose(nil)
-    }
-
-    func popoverWillShow(_ notification: Notification) {
-        popover.contentViewController?.view.window?.alphaValue = 0
-    }
-
-    func popoverShouldClose(_ popover: NSPopover) -> Bool {
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return true }
-        if !isPopoverClosing { slidePopover(opening: false) }
-        return false
-    }
-
-    func popoverWillClose(_ notification: Notification) {
-        // Keep native teardown from exposing the restored surface or its shadow.
-        popover.contentViewController?.view.window?.alphaValue = 0
-    }
-
-    func popoverDidClose(_ notification: Notification) {
-        stopMonitoringOutsideClicks()
-        finishPopoverSlide?()
-        finishPopoverSlide = nil
-        isPopoverClosing = false
-    }
-
-    private func slidePopover(opening: Bool) {
-        defer {
-            if opening && popover.isShown {
-                popover.contentViewController?.view.window?.alphaValue = 1
-            }
-        }
-        guard let window = popover.contentViewController?.view.window,
-              let frameView = window.contentView?.superview else {
-            if !opening { popover.close() }
-            return
-        }
-        frameView.wantsLayer = true
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
-              let layer = frameView.layer, layer.bounds.height > 0 else {
-            if opening {
-                finishPopoverSlide?()
-                finishPopoverSlide = nil
-                isPopoverClosing = false
-            } else {
-                popover.close()
-            }
-            return
-        }
-
-        let hiddenTransform = CATransform3DMakeTranslation(
-            0, frameView.isFlipped ? -layer.bounds.height : layer.bounds.height, 0
-        )
-        let start = finishPopoverSlide == nil
-            ? (opening ? hiddenTransform : CATransform3DIdentity)
-            : (layer.presentation()?.transform ?? layer.transform)
-        finishPopoverSlide?()
-        isPopoverClosing = !opening
-
-        let animation = CABasicAnimation(keyPath: "transform")
-        animation.fromValue = NSValue(caTransform3D: start)
-        animation.toValue = NSValue(caTransform3D: opening ? CATransform3DIdentity : hiddenTransform)
-        animation.duration = opening ? 0.36 : 0.24
-        animation.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 0.8, 0.25, 1)
-        let hadShadow = window.hasShadow
-        let token = UUID()
-        popoverSlideToken = token
-        // Presentation-layer motion must not route clicks to a different, stationary row.
-        let interactionMonitor = NSEvent.addLocalMonitorForEvents(matching: [
-            .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
-            .otherMouseDown, .otherMouseUp, .scrollWheel
-        ]) { [weak window] event in
-            event.window === window ? nil : event
-        }
-        let finish = { [weak self, weak layer, weak window] in
-            guard let self, self.popoverSlideToken == token else { return }
-            self.popoverSlideToken = nil
-            if let interactionMonitor { NSEvent.removeMonitor(interactionMonitor) }
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            layer?.removeAnimation(forKey: "popoverDrawerSlide")
-            layer?.transform = CATransform3DIdentity
-            window?.hasShadow = hadShadow
-            CATransaction.commit()
-        }
-        finishPopoverSlide = finish
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        CATransaction.setCompletionBlock { [weak self] in
-            guard let self, self.popoverSlideToken == token else { return }
-            if opening {
-                finish()
-                self.finishPopoverSlide = nil
-            } else {
-                self.popover.close()
-            }
-        }
-        // Move the complete native surface behind the window's top clipping edge.
-        window.hasShadow = false
-        layer.transform = opening ? CATransform3DIdentity : hiddenTransform
-        layer.add(animation, forKey: "popoverDrawerSlide")
-        CATransaction.commit()
-    }
-
-    private func configurePopoverWindowForFullScreenSpaces() {
-        // NSPopover creates its window lazily when it is shown. Make that
-        // window auxiliary in full-screen Spaces so the status-item popover
-        // remains available while another app owns the primary full-screen
-        // window. Its normal transient behavior still dismisses it on an
-        // outside click.
-        DispatchQueue.main.async { [weak self] in
-            guard let window = self?.popover.contentViewController?.view.window else { return }
-            window.collectionBehavior = [
-                .canJoinAllSpaces,
-                .fullScreenAuxiliary,
-                .transient,
-                .ignoresCycle
-            ]
-        }
-    }
-}
-
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     static weak var shared: AppDelegate?
 
@@ -4990,6 +4305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menuBarStatusController?.invalidate()
         fanControl.shutdown()
         monitoringLogs.shutdown()
+        monitor.appHistory.shutdown()
     }
 
     private func configureWindows() {
