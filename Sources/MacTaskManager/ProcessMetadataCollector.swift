@@ -16,9 +16,14 @@ final class ProcessMetadataCollector {
             metadata.identity = identity
             var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
             if proc_pidpath(pid, &path, UInt32(path.count)) > 0 { metadata.executablePath = String(cString: path) }
-            var architecture = proc_archinfo()
-            if proc_pidinfo(pid, PROC_PIDARCHINFO, 0, &architecture, Int32(MemoryLayout.size(ofValue: architecture))) == MemoryLayout.size(ofValue: architecture) {
-                switch architecture.p_cputype {
+            // Older SDKs omit PROC_PIDARCHINFO (19); its ABI is two 32-bit CPU fields.
+            var architecture: [Int32] = [0, 0]
+            let architectureSize = architecture.count * MemoryLayout<Int32>.stride
+            let architectureBytes = architecture.withUnsafeMutableBytes { buffer in
+                proc_pidinfo(pid, 19, 0, buffer.baseAddress, Int32(buffer.count))
+            }
+            if architectureBytes == architectureSize {
+                switch architecture[0] {
                 case CPU_TYPE_ARM64: metadata.architecture = "ARM64"
                 case CPU_TYPE_X86_64:
                     metadata.architecture = appleSilicon ? "x86_64（Rosetta）" : "x86_64"
