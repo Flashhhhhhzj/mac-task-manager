@@ -24,4 +24,7 @@ test -L "$mountpoint/Applications"
 test -s "$mountpoint/.DS_Store"
 test -s "$mountpoint/.background/dmg-background.png"
 codesign --verify --strict --verbose=2 "$mountpoint/Mac-TaskManager.app/Contents/Resources/MacFanHelper"
+if [[ -f "$mountpoint/Mac-TaskManager.app/Contents/Resources/MacSystemHelper" ]]; then
+    codesign --verify --strict --verbose=2 "$mountpoint/Mac-TaskManager.app/Contents/Resources/MacSystemHelper"
+fi
 codesign --verify --deep --strict --verbose=2 "$mountpoint/Mac-TaskManager.app"

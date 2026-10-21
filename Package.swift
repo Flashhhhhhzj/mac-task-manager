@@ -13,6 +13,7 @@ let package = Package(
             name: "MacFanHelper",
             targets: ["MacFanHelper"]
         ),
+        .executable(name: "MacSystemHelper", targets: ["MacSystemHelper"]),
         .executable(
             name: "CoolModeAlgorithmChecks",
             targets: ["CoolModeAlgorithmChecks"]
@@ -28,7 +29,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "MacTaskManager",
-            dependencies: ["MacSMC"],
+            dependencies: ["MacSMC", "MacManagement"],
             path: "Sources/MacTaskManager",
             linkerSettings: [
                 .linkedFramework("ServiceManagement")
@@ -39,6 +40,8 @@ let package = Package(
             dependencies: ["MacSMC"],
             path: "Sources/MacFanHelper"
         ),
+        .target(name: "MacManagement", dependencies: ["MacSMC"], path: "Sources/MacManagement"),
+        .executableTarget(name: "MacSystemHelper", dependencies: ["MacManagement", "MacSMC"], path: "Sources/MacSystemHelper"),
         .executableTarget(
             name: "CoolModeAlgorithmChecks",
             dependencies: ["MacSMC"],

@@ -12,6 +12,7 @@ mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULE_CACHE_PATH"
 APP_NAME="Mac-TaskManager"
 TARGET_NAME="MacTaskManager"
 FAN_HELPER_NAME="MacFanHelper"
+SYSTEM_HELPER_NAME="MacSystemHelper"
 RELEASE_VERSION="$(<VERSION)"
 if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
     echo "❌ VERSION 文件必须使用 semver 格式，例如 1.0.0 或 1.0.0-beta.2。"
@@ -27,7 +28,8 @@ build_app_bundle() {
     echo "🔨 正在编译 $APP_NAME ($target_arch)..."
 
     if ! swift build -c release --arch "$target_arch" --product "$APP_NAME" ||
-       ! swift build -c release --arch "$target_arch" --product "$FAN_HELPER_NAME"; then
+       ! swift build -c release --arch "$target_arch" --product "$FAN_HELPER_NAME" ||
+       ! swift build -c release --arch "$target_arch" --product "$SYSTEM_HELPER_NAME"; then
         cat <<EOF
 ❌ 编译失败。
 
@@ -53,7 +55,9 @@ EOF
         "$app_dir/Contents/Resources"
     cp "$bin_path" "$app_dir/Contents/MacOS/$APP_NAME"
     cp "$helper_path" "$app_dir/Contents/Resources/$FAN_HELPER_NAME"
+    cp "$(dirname "$helper_path")/$SYSTEM_HELPER_NAME" "$app_dir/Contents/Resources/$SYSTEM_HELPER_NAME"
     chmod 755 "$app_dir/Contents/Resources/$FAN_HELPER_NAME"
+    chmod 755 "$app_dir/Contents/Resources/$SYSTEM_HELPER_NAME"
     cp assets/app-icon.svg "$app_dir/Contents/Resources/app-icon.svg"
     cp assets/app-icon.png "$app_dir/Contents/Resources/app-icon.png"
     cp THIRD_PARTY_NOTICES.md "$app_dir/Contents/Resources/THIRD_PARTY_NOTICES.md"
@@ -93,11 +97,12 @@ EOF
 
     # 链接器签名未封装 App 资源；先签 Helper，再封装完整 App。
     codesign --force --sign - --timestamp=none "$app_dir/Contents/Resources/$FAN_HELPER_NAME"
+    codesign --force --sign - --timestamp=none "$app_dir/Contents/Resources/$SYSTEM_HELPER_NAME"
     codesign --force --sign - --timestamp=none "$app_dir"
     codesign --verify --deep --strict --verbose=2 "$app_dir"
 
     echo "✅ [$target_arch] 编译与打包完成（ad-hoc 签名，无开发者证书）: $app_dir"
-    echo "ℹ️ 首次打开应用后，点击“启用完整功能”并完成系统管理员授权即可配置风扇服务。"
+    echo "ℹ️ 首次打开应用后，点击“启用完整功能”并完成系统管理员授权即可配置风扇与系统管理服务。"
 }
 
 create_dmg_package() {

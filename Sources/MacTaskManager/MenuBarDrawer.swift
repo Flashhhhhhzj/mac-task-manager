@@ -166,7 +166,9 @@ final class MenuBarStatusController: NSObject {
         slidingView.frame = NSRect(origin: .zero, size: size)
         surface.frame = slidingView.bounds
         let arrowX = min(max(anchor.midX - x - MenuBarDrawerLayout.sidePadding, 24), MenuBarDrawerLayout.width - 24)
-        surface.rootView = MenuBarDrawerSurface(monitor: surface.rootView.monitor, arrowX: arrowX, bodyHeight: bodyHeight)
+        if surface.rootView.arrowX != arrowX || surface.rootView.bodyHeight != bodyHeight {
+            surface.rootView = MenuBarDrawerSurface(monitor: surface.rootView.monitor, arrowX: arrowX, bodyHeight: bodyHeight)
+        }
         contentFrame = NSRect(x: x + MenuBarDrawerLayout.sidePadding,
                               y: panel.frame.minY + MenuBarDrawerLayout.bottomPadding,
                               width: MenuBarDrawerLayout.width,
@@ -176,8 +178,10 @@ final class MenuBarStatusController: NSObject {
         slidingView.layer?.transform = hiddenTransform
         CATransaction.commit()
         surface.layoutSubtreeIfNeeded()
-        slideDrawer(opening: true)
         panel.makeKeyAndOrderFront(nil)
+        // Prepare the first frame before starting the animation's clock.
+        panel.displayIfNeeded()
+        slideDrawer(opening: true)
         startMonitoringOutsideClicks()
     }
 
@@ -197,8 +201,10 @@ final class MenuBarStatusController: NSObject {
         let animation = CABasicAnimation(keyPath: "transform")
         animation.fromValue = NSValue(caTransform3D: start)
         animation.toValue = NSValue(caTransform3D: target)
-        animation.duration = (opening ? 0.36 : 0.24) * max(0.15, distance)
-        animation.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 0.8, 0.25, 1)
+        animation.duration = max(0.16, (opening ? 0.32 : 0.24) * sqrt(distance))
+        animation.timingFunction = opening
+            ? CAMediaTimingFunction(controlPoints: 0.22, 0.61, 0.36, 1)
+            : CAMediaTimingFunction(controlPoints: 0.4, 0, 0.65, 1)
 
         let finish = { [weak self] in
             guard let self, self.animationID == token else { return }

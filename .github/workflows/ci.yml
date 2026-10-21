@@ -29,6 +29,20 @@ jobs:
         run: |
           swift build -c release --product Mac-TaskManager
           swift build -c release --product MacFanHelper
+          swift build -c release --product MacSystemHelper
 
       - name: Run cooling algorithm and authorization checks
         run: swift run -c release CoolModeAlgorithmChecks
+
+      - name: Check process classification
+        run: |
+          swiftc Sources/MacTaskManager/ProcessClassification.swift Tests/MacTaskManagerTests/ProcessClassificationChecks.swift -o "$RUNNER_TEMP/ProcessClassificationChecks"
+          "$RUNNER_TEMP/ProcessClassificationChecks"
+
+      - name: Check process sorting and grouping
+        run: |
+          swiftc Sources/MacTaskManager/ProcessTableData.swift Tests/MacTaskManagerTests/ProcessTableChecks.swift -o "$RUNNER_TEMP/ProcessTableChecks"
+          "$RUNNER_TEMP/ProcessTableChecks"
+
+      - name: Check history and service management
+        run: bash scripts/check-management-pages.sh
