@@ -19,6 +19,9 @@ let package = Package(
             targets: ["CoolModeAlgorithmChecks"]
         )
     ],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0")
+    ],
     targets: [
         .target(
             name: "MacSMC",
@@ -29,10 +32,11 @@ let package = Package(
         ),
         .executableTarget(
             name: "MacTaskManager",
-            dependencies: ["MacSMC", "MacManagement"],
+            dependencies: ["MacSMC", "MacManagement", .product(name: "Sparkle", package: "Sparkle")],
             path: "Sources/MacTaskManager",
             linkerSettings: [
-                .linkedFramework("ServiceManagement")
+                .linkedFramework("ServiceManagement"),
+                .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])
             ]
         ),
         .executableTarget(

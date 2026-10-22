@@ -1,5 +1,14 @@
 # Third-party notices
 
+## Sparkle
+
+Updates use Sparkle 2.10.0, copyright Andy Matuschak and the Sparkle Project.
+Its MIT and bundled component license notices are included in
+`Contents/Resources/Sparkle-LICENSE` in the application and `licenses/Sparkle-LICENSE`
+in this repository. Source: https://github.com/sparkle-project/Sparkle
+
+## AppleSMC
+
 The AppleSMC interoperability layer and Apple Silicon fan-control sequence were
 implemented with reference to the MIT-licensed `agoodkind/macos-smc-fan`
 research project.

@@ -138,6 +138,14 @@ CPU / GPU 占用 ─┐
 3. 直接使用进程与性能页；需要调速和清凉模式时，点击“启用完整功能”完成首次授权。
 4. 在“设置”中选择主题、结束任务方式、清凉模式策略，以及是否保存监控日志。
 
+### 应用内更新
+
+“设置”底部的“更新”区域支持手动检查及每日自动检查正式版。发现新版后自动下载，校验并准备完成后弹出“更新并重启 / 暂不更新”。只有确认后才替换 App 并重启；暂不更新会取消本次安装，之后可以重新检查。退出应用时也会先取消未经确认的安装。
+
+更新从本项目公开的 GitHub Release 下载，按 Mac 硬件选择 Apple Silicon 或 Intel 安装包。应用内置 Ed25519 公钥，更新信息和安装包均需通过校验；校验失败停止更新。该更新签名不使用 Apple 账号、公司证书或公证服务，也不能代替 Gatekeeper 的首次启动许可。
+
+1.0.0 及更早版本没有更新器，需要手动安装一次包含更新功能的版本。应用位置不可写时，macOS 可能要求管理员批准替换；已安装后台助手的升级仍遵守原有授权流程。发布维护说明见 [updates/README.md](updates/README.md)。
+
 ### 从源码构建
 
 **要求**
@@ -164,11 +172,11 @@ swift run -c release CoolModeAlgorithmChecks
 
 ## 打包 DMG
 
-版本号统一保存在根目录 `VERSION`。每次发布前用同步脚本更新它；DMG 文件名和 App 内版本会从该文件读取。`APP_BUILD_NUMBER` 用于应用包的 `CFBundleVersion`。
+版本号保存在根目录 `VERSION`，递增构建号保存在 `BUILD_NUMBER`。同步脚本在版本改变时自动递增构建号，App 与 CI 使用相同数值，更新器按构建号判断新旧。同版本重新发布也必须先递增 `BUILD_NUMBER`，不能用较小的本地编号覆盖新版本。
 
 ```sh
-./scripts/sync-version.sh 1.0.0
-APP_BUILD_NUMBER="12" ./build.sh dmg
+./scripts/sync-version.sh 1.0.1
+./build.sh dmg
 ```
 
 默认生成 arm64 和 x64 两个 DMG，也可以只打包指定架构：
@@ -184,9 +192,9 @@ APP_BUILD_NUMBER="12" ./build.sh dmg
 
 ## GitHub Actions
 
-PR 和 `main` 推送会编译 App、风扇 Helper 与系统管理 Helper，并运行清凉模式、授权边界、进程分类排序、历史记录和服务管理自检。推送与 `VERSION` 完全一致的 `v<版本号>` 标签会构建 arm64、x64 两个包含 ad-hoc App、未公证的 DMG，只发布这两个带版本号的安装包；带 `beta` 等后缀的版本标记为预发布，无后缀的版本作为正式 Release。重跑现有标签时会先替换该 Release 中旧的 Mac-TaskManager DMG。
+PR 和 `main` 推送会编译 App、风扇 Helper 与系统管理 Helper，并运行清凉模式、授权边界、进程分类排序、历史记录和服务管理自检。推送与 `VERSION` 完全一致的 `v<版本号>` 标签会构建 arm64、x64 两个包含 ad-hoc App、未公证的 DMG，并发布两个已签名的 `appcast-*.xml` 更新信息文件；带 `beta` 等后缀的版本标记为预发布，无后缀的版本作为正式 Release。内置更新器只使用最新正式 Release。重跑现有标签时会替换该 Release 的对应资产。
 
-自动构建不再读取签名证书、证书密码或 Apple 公证 API 的 Actions secrets。
+自动构建不读取 Apple 签名证书、证书密码或公证 API。发布更新需要仓库的 `SPARKLE_PRIVATE_KEY` secret，它只用于独立的 Ed25519 更新签名。
 
 ## 架构速览
 

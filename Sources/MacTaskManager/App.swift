@@ -3413,6 +3413,10 @@ struct SettingsPage: View {
                     .padding(.bottom, 20)
                 }
 
+                SettingsSectionTitle("更新")
+                    .padding(.top, 30)
+                AppUpdateSettings(updates: .shared, dropdownCoordinator: dropdownCoordinator)
+
                 VStack(spacing: 6) {
                     Text(applicationVersionText)
                         .font(.system(size: 11))
@@ -4252,6 +4256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         DispatchQueue.main.async {
             self.fanControl.startBackgroundLoggingIfNeeded()
             self.configureWindows()
+            AppUpdateController.shared.start()
             // The appearance is finalized by configureWindows(). Creating the
             // template status image only afterwards prevents the menu-bar
             // renderer from retaining the launch-time appearance snapshot.
@@ -4265,6 +4270,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         !AppRuntimePreferences.keepsRunningAfterWindowClose
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        AppUpdateController.shared.applicationShouldTerminate()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
