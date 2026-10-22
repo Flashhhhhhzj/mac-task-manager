@@ -9,5 +9,10 @@ if [ "$#" -ne 1 ] || [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.
     exit 2
 fi
 
-printf '%s\n' "$VERSION" > "$ROOT_DIR/VERSION"
-echo "已更新版本号: $VERSION"
+if [[ "$(<"$ROOT_DIR/VERSION")" != "$VERSION" ]]; then
+    build_number="$(<"$ROOT_DIR/BUILD_NUMBER")"
+    [[ "$build_number" =~ ^[1-9][0-9]*$ ]] || { echo "BUILD_NUMBER 无效" >&2; exit 1; }
+    printf '%s\n' "$((build_number + 1))" > "$ROOT_DIR/BUILD_NUMBER"
+    printf '%s\n' "$VERSION" > "$ROOT_DIR/VERSION"
+fi
+echo "版本: ${VERSION}，构建: $(<"$ROOT_DIR/BUILD_NUMBER")"

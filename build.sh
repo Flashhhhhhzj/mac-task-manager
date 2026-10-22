@@ -19,7 +19,12 @@ if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za
     exit 1
 fi
 APP_VERSION="${RELEASE_VERSION%%-*}"
-APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-8}"
+APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-$(<BUILD_NUMBER)}"
+if [[ ! "$APP_BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+    echo "❌ BUILD_NUMBER 必须为递增的正整数。" >&2
+    exit 1
+fi
+UPDATE_PUBLIC_KEY="$(<updates/public-key.txt)"
 
 build_app_bundle() {
     local target_arch="${1:-arm64}"
@@ -47,12 +52,18 @@ EOF
     local helper_path
     bin_path="$(swift build -c release --arch "$target_arch" --show-bin-path)/$APP_NAME"
     helper_path="$(swift build -c release --arch "$target_arch" --show-bin-path)/$FAN_HELPER_NAME"
-    cp "$bin_path" "./$APP_NAME"
+    # A standalone binary cannot locate the embedded updater framework.
+    cat > "./$APP_NAME" <<'LAUNCHER'
+#!/bin/bash
+exec /usr/bin/open "$(cd "$(dirname "$0")" && pwd)/Mac-TaskManager.app" --args "$@"
+LAUNCHER
+    chmod 755 "./$APP_NAME"
 
     rm -rf "$app_dir"
     mkdir -p \
         "$app_dir/Contents/MacOS" \
-        "$app_dir/Contents/Resources"
+        "$app_dir/Contents/Resources" \
+        "$app_dir/Contents/Frameworks"
     cp "$bin_path" "$app_dir/Contents/MacOS/$APP_NAME"
     cp "$helper_path" "$app_dir/Contents/Resources/$FAN_HELPER_NAME"
     cp "$(dirname "$helper_path")/$SYSTEM_HELPER_NAME" "$app_dir/Contents/Resources/$SYSTEM_HELPER_NAME"
@@ -61,6 +72,10 @@ EOF
     cp assets/app-icon.svg "$app_dir/Contents/Resources/app-icon.svg"
     cp assets/app-icon.png "$app_dir/Contents/Resources/app-icon.png"
     cp THIRD_PARTY_NOTICES.md "$app_dir/Contents/Resources/THIRD_PARTY_NOTICES.md"
+    cp licenses/Sparkle-LICENSE "$app_dir/Contents/Resources/Sparkle-LICENSE"
+    local sparkle_source=".build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+    local sparkle_framework="$app_dir/Contents/Frameworks/Sparkle.framework"
+    ditto "$sparkle_source" "$sparkle_framework"
 
     cat > "$app_dir/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -89,13 +104,36 @@ EOF
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>SUFeedURL</key>
+    <string>https://github.com/Flashhhhhhzj/mac-task-manager/releases/latest/download/appcast-arm64.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>$UPDATE_PUBLIC_KEY</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
+    <key>SUAllowsAutomaticUpdates</key>
+    <false/>
+    <key>SUAutomaticallyUpdate</key>
+    <false/>
+    <key>SUSendProfileInfo</key>
+    <false/>
+    <key>SUVerifyUpdateBeforeExtraction</key>
+    <true/>
+    <key>SURequireSignedFeed</key>
+    <true/>
 </dict>
 </plist>
 EOF
 
     plutil -lint "$app_dir/Contents/Info.plist"
 
-    # 链接器签名未封装 App 资源；先签 Helper，再封装完整 App。
+    # 从内到外封装，所有可执行文件均使用本机 ad-hoc 签名。
+    codesign --force --sign - --timestamp=none "$sparkle_framework/Versions/B/Autoupdate"
+    codesign --force --sign - --timestamp=none "$sparkle_framework/Versions/B/Updater.app"
+    codesign --force --sign - --timestamp=none "$sparkle_framework/Versions/B/XPCServices/Downloader.xpc"
+    codesign --force --sign - --timestamp=none "$sparkle_framework/Versions/B/XPCServices/Installer.xpc"
+    codesign --force --sign - --timestamp=none "$sparkle_framework"
     codesign --force --sign - --timestamp=none "$app_dir/Contents/Resources/$FAN_HELPER_NAME"
     codesign --force --sign - --timestamp=none "$app_dir/Contents/Resources/$SYSTEM_HELPER_NAME"
     codesign --force --sign - --timestamp=none "$app_dir"
