@@ -3439,7 +3439,7 @@ struct SettingsPage: View {
         guard !monitoringLogs.isExporting else { return }
         monitoringLogs.recordSystemSnapshot(monitor.monitoringLogSnapshot())
         fanControl.captureSnapshotForLogExport {
-            monitoringLogs.exportArchive { result in
+            monitoringLogs.exportArchive(management: state.management.diagnostics) { result in
                 switch result {
                 case .success:
                     fanControl.showNotice("系统运行日志已导出")

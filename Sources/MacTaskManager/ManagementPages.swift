@@ -51,10 +51,7 @@ struct ManagementPage: View {
         let visibleRows = rows
         return VStack(spacing: 0) {
             commandBar
-            if page == .startup {
-                HStack { Spacer(); Text("上次固件启动耗时：不适用").font(.system(size: TaskManagerStyle.tableHeaderFontSize)).foregroundColor(TaskManagerStyle.text) }
-                    .padding(.horizontal, 20).frame(height: 54)
-            } else if page == .history {
+            if page == .history {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("自 \(history.startedAt.formatted(date: .numeric, time: .omitted)) 以来，当前用户和系统账户在软件运行期间的资源使用情况。")
                         .foregroundColor(TaskManagerStyle.text)
@@ -76,7 +73,7 @@ struct ManagementPage: View {
                     if visibleRows.isEmpty {
                         VStack(spacing: 10) {
                             if workspace.isLoading { ProgressView().controlSize(.small) }
-                            Text(workspace.isLoading ? "正在读取系统数据…" : state.searchText.isEmpty ? "暂无可显示的项目" : "没有匹配的项目")
+                            Text(workspace.isLoading ? workspace.loadingDescription : state.searchText.isEmpty ? "暂无可显示的项目" : "没有匹配的项目")
                                 .font(.system(size: TaskManagerStyle.tableBodyFontSize)).foregroundColor(TaskManagerStyle.muted)
                         }.allowsHitTesting(false)
                     }

@@ -13,8 +13,8 @@ public enum SystemManagementXPC {
     public static let serviceName = "local.Mac-TaskManager.SystemHelper.v1"
     public static let version = "1"
 
-    public static func snapshot() throws -> [ServiceRecord] {
-        let data: Data = try request { proxy, finish in
+    public static func snapshot(timeout: TimeInterval = 30) throws -> [ServiceRecord] {
+        let data: Data = try request(timeout: timeout) { proxy, finish in
             proxy.services { data, error in
                 if let data { finish(.success(data)) }
                 else { finish(.failure(ManagementFailure(error ?? "无法读取系统服务。"))) }
@@ -32,8 +32,8 @@ public enum SystemManagementXPC {
         }
     }
 
-    public static func backgroundItems() throws -> String {
-        let data = try request { proxy, finish in
+    public static func backgroundItems(timeout: TimeInterval = 30) throws -> String {
+        let data = try request(timeout: timeout) { proxy, finish in
             proxy.backgroundItems { text, error in
                 if let text { finish(.success(Data(text.utf8))) }
                 else { finish(.failure(ManagementFailure(error ?? "无法读取后台项目。"))) }
