@@ -87,7 +87,7 @@ final class MonitoringLogRecorder: ObservableObject {
         journal.append(decision, category: .coolMode)
     }
 
-    func exportArchive(completion: @escaping (Result<URL, Error>) -> Void) {
+    func exportArchive(management: [String: String] = [:], completion: @escaping (Result<URL, Error>) -> Void) {
         let savePanel = NSSavePanel()
         savePanel.title = "导出系统运行日志"
         savePanel.message = "日志仅保存到你选择的位置，不会上传网络。"
@@ -126,7 +126,8 @@ final class MonitoringLogRecorder: ObservableObject {
                     exportedAt: Date(),
                     system: systemSnapshot,
                     fans: fanSnapshot,
-                    latestCoolModeDecision: coolModeDecision
+                    latestCoolModeDecision: coolModeDecision,
+                    management: management
                 )
                 try Self.writeJSON(currentSnapshot, named: "current-snapshot.json", in: exportDirectory)
 
@@ -359,6 +360,7 @@ private struct MonitoringLogCurrentSnapshot: Codable {
     let system: MonitoringSystemLogSnapshot?
     let fans: MonitoringFanLogSnapshot?
     let latestCoolModeDecision: MonitoringCoolModeDecision?
+    let management: [String: String]?
 }
 
 private struct MonitoringLogManifest: Codable {

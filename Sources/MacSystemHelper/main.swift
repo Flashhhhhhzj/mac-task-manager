@@ -47,7 +47,25 @@ final class SystemListener: NSObject, NSXPCListenerDelegate {
 
 do {
     let args = CommandLine.arguments
-    if args.count == 3, args[1] == "install", let uid = UInt32(args[2]) {
+    if args.count == 2, args[1].hasPrefix("catalog-") {
+        // Native login-item and file metadata APIs can block; this process is disposable.
+        switch args[1] {
+        case "catalog-user", "catalog-system":
+            let records = try args[1] == "catalog-user" ? ServiceCatalog.userSnapshot() : ServiceCatalog.systemSnapshot(runtime: false)
+            let enriched = records.map { record -> ServiceRecord in
+                var entry = record
+                if let name = StartupCatalog.applicationName(entry.programPath) { entry.summary = name }
+                return entry
+            }
+            FileHandle.standardOutput.write(try JSONEncoder().encode(enriched))
+        case "catalog-startup":
+            let data = try FileHandle.standardInput.read(upToCount: 8 * 1_024 * 1_024) ?? Data()
+            let request = try JSONDecoder().decode(StartupCatalogRequest.self, from: data)
+            let result = StartupCatalog.load(services: request.services, backgroundOutput: request.backgroundOutput)
+            FileHandle.standardOutput.write(try JSONEncoder().encode(StartupCatalogResult(items: result.items, warnings: result.warnings)))
+        default: throw ManagementFailure("无效的只读目录请求。")
+        }
+    } else if args.count == 3, args[1] == "install", let uid = UInt32(args[2]) {
         try SystemHelperInstallation.install(sourceURL: URL(fileURLWithPath: args[0]), uid: uid)
     } else if args.count == 2, args[1] == "uninstall" {
         try SystemHelperInstallation.uninstall()

@@ -10,13 +10,27 @@ public struct ManagementFailure: LocalizedError {
 
 public enum ManagementCommand {
     @discardableResult
-    public static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval = 6) throws -> String {
+    public static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval = 6, input: Data? = nil) throws -> String {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: executable)
         task.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
         environment["LC_ALL"] = "C"
         task.environment = environment
+        let inputURL = FileManager.default.temporaryDirectory.appendingPathComponent("MacTaskManager-input-\(UUID().uuidString)")
+        var inputHandle: FileHandle?
+        defer {
+            try? inputHandle?.close()
+            if input != nil { try? FileManager.default.removeItem(at: inputURL) }
+        }
+        if let input {
+            guard input.count < 8 * 1_024 * 1_024,
+                  FileManager.default.createFile(atPath: inputURL.path, contents: input, attributes: [.posixPermissions: 0o600]) else {
+                throw ManagementFailure("无法准备系统读取请求。")
+            }
+            inputHandle = try FileHandle(forReadingFrom: inputURL)
+            task.standardInput = inputHandle
+        } else { task.standardInput = FileHandle.nullDevice }
         let pipe = Pipe()
         task.standardOutput = pipe
         task.standardError = pipe
@@ -26,8 +40,17 @@ public enum ManagementCommand {
         let reader = CommandOutput()
         let readFinished = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .utility).async {
-            reader.data = pipe.fileHandleForReading.readDataToEndOfFile()
-            readFinished.signal()
+            defer { readFinished.signal() }
+            do {
+                while let chunk = try pipe.fileHandleForReading.read(upToCount: 65_536), !chunk.isEmpty {
+                    guard reader.data.count + chunk.count < 8 * 1_024 * 1_024 else {
+                        reader.error = ManagementFailure("系统返回的数据过大。")
+                        if task.isRunning { kill(task.processIdentifier, SIGKILL) }
+                        return
+                    }
+                    reader.data.append(chunk)
+                }
+            } catch { reader.error = error }
         }
         guard finished.wait(timeout: .now() + timeout) == .success else {
             task.terminate()
@@ -35,7 +58,7 @@ public enum ManagementCommand {
             throw ManagementFailure("系统命令超时，请重试。")
         }
         guard readFinished.wait(timeout: .now() + 2) == .success else { throw ManagementFailure("无法读取系统命令结果。") }
-        guard reader.data.count < 8 * 1_024 * 1_024 else { throw ManagementFailure("系统返回的数据过大。") }
+        if let error = reader.error { throw error }
         let output = String(decoding: reader.data, as: UTF8.self)
         guard task.terminationStatus == 0 else {
             throw ManagementFailure(String(output.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1200)))
@@ -44,7 +67,10 @@ public enum ManagementCommand {
     }
 }
 
-private final class CommandOutput: @unchecked Sendable { var data = Data() }
+private final class CommandOutput: @unchecked Sendable {
+    var data = Data()
+    var error: Error?
+}
 
 public struct ServiceIdentifier: Hashable, Codable {
     public let domain: String

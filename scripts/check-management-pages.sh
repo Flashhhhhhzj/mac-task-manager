@@ -17,10 +17,26 @@ swiftc Sources/MacTaskManager/ProcessTableData.swift Sources/MacTaskManager/AppH
     Tests/MacTaskManagerTests/HistoryChecks.swift -o "$management_tmp_dir/history"
 "$management_tmp_dir/history"
 
-swiftc -I "$management_bin_dir" -I "$management_bin_dir/Modules" Sources/MacTaskManager/StartupCatalog.swift \
+swiftc -I "$management_bin_dir" -I "$management_bin_dir/Modules" -parse-as-library \
     Tests/MacTaskManagerTests/SystemManagementChecks.swift "${management_objects[@]}" \
     -framework IOKit -o "$management_tmp_dir/services"
 "$management_tmp_dir/services"
+
+swiftc -parse-as-library -I "$management_bin_dir" -I "$management_bin_dir/Modules" \
+    Tests/MacTaskManagerTests/CatalogReadChecks.swift "${management_objects[@]}" \
+    -framework IOKit -o "$management_tmp_dir/catalog-reads"
+"$management_tmp_dir/catalog-reads" "$management_bin_dir/MacSystemHelper"
+
+loading_app="$management_tmp_dir/LoadingChecks.app"
+mkdir -p "$loading_app/Contents/MacOS"
+cat > "$loading_app/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>LoadingChecks</string><key>CFBundleIdentifier</key><string>local.MacTaskManager.LoadingChecks</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>
+PLIST
+swiftc -parse-as-library -I "$management_bin_dir" -I "$management_bin_dir/Modules" \
+    Sources/MacTaskManager/ProcessTableData.swift Sources/MacTaskManager/TaskManagerPage.swift \
+    Sources/MacTaskManager/ManagementWorkspace.swift Tests/MacTaskManagerTests/ManagementLoadingChecks.swift \
+    "${management_objects[@]}" -framework IOKit -o "$loading_app/Contents/MacOS/LoadingChecks"
+"$loading_app/Contents/MacOS/LoadingChecks"
 
 # This optional check only creates and removes its own uniquely named user LaunchAgent.
 if [[ "${1:-}" == "--user-service-lifecycle" ]]; then

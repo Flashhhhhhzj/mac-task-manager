@@ -86,8 +86,29 @@ final class ManagementWorkspace: ObservableObject {
     private var activePage: TaskManagerPage?
     private var timer: Timer?
     private var lastStartupLoad = Date.distantPast
-    private var pendingRefresh: TaskManagerPage?
+    private var loadingPages: Set<TaskManagerPage> = []
+    private var pageMessages: [TaskManagerPage: String] = [:]
+    @Published private var readStages: [TaskManagerPage: String] = [:]
     private var accounts: [UInt32: (String, String)] = [:]
+
+    var loadingDescription: String { activePage.flatMap { readStages[$0] } ?? "正在读取系统数据…" }
+
+    var diagnostics: [String: String] {
+        var result = ["applicationVersion": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知",
+                      "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "未知",
+                      "macOS": ProcessInfo.processInfo.operatingSystemVersionString,
+                      "activePage": activePage?.rawValue ?? "无", "authorized": String(authorized)]
+        for (page, stage) in readStages {
+            result["\(page.rawValue).stage"] = stage
+            result["\(page.rawValue).loading"] = String(loadingPages.contains(page))
+            result["\(page.rawValue).error"] = pageMessages[page]
+        }
+        return result
+    }
+
+    private func readStage(_ stage: String, page: TaskManagerPage) {
+        DispatchQueue.main.async { self.readStages[page] = stage }
+    }
 
     func refreshAuthorization() {
         queue.async {
@@ -98,7 +119,8 @@ final class ManagementWorkspace: ObservableObject {
 
     func activate(_ page: TaskManagerPage) {
         activePage = page
-        message = nil
+        message = pageMessages[page]
+        isLoading = loadingPages.contains(page)
         timer?.invalidate()
         refresh(page: page)
         if page == .services || page == .users {
@@ -110,68 +132,108 @@ final class ManagementWorkspace: ObservableObject {
     }
 
     func refresh(page: TaskManagerPage, force: Bool = false) {
-        guard !isLoading, !isWorking else {
-            if force || activePage == page { pendingRefresh = page }
-            return
-        }
-        guard [.services, .startup, .users].contains(page) else { return }
+        guard !loadingPages.contains(page), !isWorking,
+              [.services, .startup, .users].contains(page) else { return }
         if page == .startup && !force && Date().timeIntervalSince(lastStartupLoad) < 30 { return }
-        isLoading = true
-        queue.async {
+        loadingPages.insert(page)
+        readStages[page] = "正在检查系统管理授权…"
+        if activePage == page { isLoading = true; message = nil }
+        // Each page has at most one bounded read; a stuck native API cannot hold the app's queue.
+        DispatchQueue.global(qos: .utility).async {
             let authorized = SystemManagementAuthorization.isEnabled
+            DispatchQueue.main.async { self.authorized = authorized }
             if page == .users {
                 var console: uid_t = 0
                 let consoleName = SCDynamicStoreCopyConsoleUser(nil, &console, nil) as String?
                 let sessionResult = Result { try ManagementCommand.run("/usr/bin/who", []) }
                 let sessions = (try? sessionResult.get()).map { Set($0.split(separator: "\n").compactMap { $0.split(whereSeparator: \.isWhitespace).first.map(String.init) }) }
                 DispatchQueue.main.async {
-                    self.authorized = authorized
                     self.consoleUID = consoleName == nil || consoleName == "loginwindow" ? nil : console
                     self.sessionAccounts = sessions ?? []
-                    if self.activePage == page, case .failure(let error) = sessionResult { self.message = error.localizedDescription }
-                    self.finishRefresh()
+                    let warning: String?
+                    if case .failure(let error) = sessionResult { warning = error.localizedDescription } else { warning = nil }
+                    self.finishRefresh(page, warning: warning)
                 }
                 return
             }
             var warnings: [String] = []
-            var services: [ServiceRecord] = []
-            do { services += try ServiceCatalog.userSnapshot() } catch { warnings.append("用户服务：\(error.localizedDescription)") }
-            do { services += try authorized ? SystemManagementXPC.snapshot() : ServiceCatalog.systemSnapshot(runtime: false) }
-            catch { warnings.append("系统服务：\(error.localizedDescription)") }
-            let enriched = services.map { service -> ServiceRecord in
-                var entry = service
-                if let name = StartupCatalog.applicationName(entry.programPath) { entry.summary = name }
-                return entry
+            var records: [ServiceRecord] = []
+            let helper = SystemManagementAuthorization.bundledURL.path
+            for scope in ["user", "system"] {
+                self.readStage(scope == "user" ? "正在读取用户服务…" : "正在读取系统服务…", page: page)
+                let domain = scope == "user" ? "gui/\(getuid())" : "system"
+                let result = Result { () throws -> [ServiceRecord] in
+                    let output = try ManagementCommand.run(helper, ["catalog-\(scope)"], timeout: 8)
+                    return try JSONDecoder().decode([ServiceRecord].self, from: Data(output.utf8))
+                }
+                switch result {
+                case .success(let values):
+                    records += values
+                    self.publishServices(values, domain: domain, page: page)
+                case .failure(let error):
+                    warnings.append("\(scope == "user" ? "用户服务" : "系统服务")：\(error.localizedDescription)")
+                }
+            }
+            if authorized {
+                self.readStage("正在读取系统服务运行状态…", page: page)
+                do {
+                    let summaries = Dictionary(records.map { ($0.id, $0.summary) }, uniquingKeysWith: { first, _ in first })
+                    let values = try SystemManagementXPC.snapshot(timeout: 8).map { record -> ServiceRecord in
+                        var value = record
+                        value.summary = summaries[value.id] ?? value.summary
+                        return value
+                    }
+                    records.removeAll { $0.identifier.domain == "system" }
+                    records += values
+                    self.publishServices(values, domain: "system", page: page)
+                } catch { warnings.append("系统服务运行状态：\(error.localizedDescription)") }
             }
             var items: [StartupItem]?
             if page == .startup {
                 var backgroundOutput: String?
                 if authorized {
-                    do { backgroundOutput = try SystemManagementXPC.backgroundItems() }
+                    self.readStage("正在读取 macOS 后台项目…", page: page)
+                    do { backgroundOutput = try SystemManagementXPC.backgroundItems(timeout: 8) }
                     catch { warnings.append("后台项目：\(error.localizedDescription)") }
                 }
-                let result = StartupCatalog.load(services: enriched, backgroundOutput: backgroundOutput)
-                items = result.items
-                warnings += result.warnings
+                do {
+                    self.readStage("正在解析登录项目及应用信息…", page: page)
+                    let request = StartupCatalogRequest(services: records, backgroundOutput: backgroundOutput)
+                    let output = try ManagementCommand.run(helper, ["catalog-startup"], timeout: 10, input: JSONEncoder().encode(request))
+                    let result = try JSONDecoder().decode(StartupCatalogResult.self, from: Data(output.utf8))
+                    items = result.items
+                    warnings += result.warnings
+                } catch { warnings.append("登录项目及应用信息：\(error.localizedDescription) 已保留可读取的启动项目，可在三点菜单中重试刷新。") }
             }
             let finalWarnings = warnings
             let finalItems = items
             DispatchQueue.main.async {
-                self.authorized = authorized
-                self.services = enriched
-                if let finalItems { self.startup = finalItems; self.lastStartupLoad = Date() }
-                if self.activePage == page && !finalWarnings.isEmpty { self.message = finalWarnings.joined(separator: "\n") }
-                self.finishRefresh()
+                if let finalItems {
+                    self.startup = finalItems
+                    if finalWarnings.isEmpty { self.lastStartupLoad = Date() }
+                }
+                self.finishRefresh(page, warning: finalWarnings.isEmpty ? nil : finalWarnings.joined(separator: "\n"))
             }
         }
     }
 
-    private func finishRefresh() {
-        isLoading = false
-        if let page = pendingRefresh {
-            pendingRefresh = nil
-            if activePage == page { refresh(page: page, force: true) }
+    private func publishServices(_ records: [ServiceRecord], domain: String, page: TaskManagerPage) {
+        DispatchQueue.main.async {
+            guard self.activePage == page else { return }
+            self.services.removeAll { $0.identifier.domain == domain }
+            self.services += records
+            if page == .startup {
+                let base = StartupCatalog.serviceItems(self.services)
+                let ids = Set(base.map(\.id))
+                self.startup = base + self.startup.filter { !ids.contains($0.id) && $0.service == nil }
+            }
         }
+    }
+
+    private func finishRefresh(_ page: TaskManagerPage, warning: String?) {
+        loadingPages.remove(page)
+        pageMessages[page] = warning
+        if activePage == page { isLoading = false; message = warning }
     }
 
     func enableSystemManagement() {

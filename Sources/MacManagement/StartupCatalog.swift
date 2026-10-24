@@ -1,40 +1,46 @@
 import AppKit
 import CoreServices
 import Security
-import MacManagement
 
-struct StartupItem: Identifiable {
-    let id: String
-    var name: String
-    var publisher: String
-    var path: String?
-    var enabled: Bool?
-    var source: String
-    var service: ServiceIdentifier?
-    var legacyURL: URL?
-    var requiresSettings = false
-    var protectionReason: String?
-    var backgroundIdentifier: String?
-    var state: String { requiresSettings && protectionReason != nil ? "等待系统允许" : enabled.map { $0 ? "已启用" : "已禁用" } ?? "未知" }
-    var impact: String { enabled.map { $0 ? "未计量" : "无" } ?? "—" }
+public struct StartupItem: Identifiable, Codable {
+    public let id: String
+    public var name: String
+    public var publisher: String
+    public var path: String?
+    public var enabled: Bool?
+    public var source: String
+    public var service: ServiceIdentifier?
+    public var legacyURL: URL?
+    public var requiresSettings = false
+    public var protectionReason: String?
+    public var backgroundIdentifier: String?
+    public var state: String { requiresSettings && protectionReason != nil ? "等待系统允许" : enabled.map { $0 ? "已启用" : "已禁用" } ?? "未知" }
+    public var impact: String { enabled.map { $0 ? "未计量" : "无" } ?? "—" }
 }
 
-enum StartupCatalog {
+public struct StartupCatalogRequest: Codable {
+    public let services: [ServiceRecord]
+    public let backgroundOutput: String?
+    public init(services: [ServiceRecord], backgroundOutput: String?) {
+        self.services = services; self.backgroundOutput = backgroundOutput
+    }
+}
+
+public struct StartupCatalogResult: Codable {
+    public let items: [StartupItem]
+    public let warnings: [String]
+    public init(items: [StartupItem], warnings: [String]) { self.items = items; self.warnings = warnings }
+}
+
+public enum StartupCatalog {
+    // The read-only subprocess must use the application's existing login-item preferences.
+    private static let preferences = UserDefaults(suiteName: "local.Mac-TaskManager") ?? .standard
     static let disabledLoginKey = "DisabledLegacyLoginItems"
     static let hiddenLoginKey = "DisabledLegacyLoginItemHidden"
 
-    static func load(services: [ServiceRecord], backgroundOutput: String? = nil) -> (items: [StartupItem], warnings: [String]) {
+    public static func load(services: [ServiceRecord], backgroundOutput: String? = nil) -> (items: [StartupItem], warnings: [String]) {
         var warnings: [String] = []
-        var items: [StartupItem] = services.filter {
-            $0.startsAutomatically && $0.plistPath?.hasPrefix("/System/") == false && !$0.identifier.label.hasPrefix("com.apple.")
-                && !$0.identifier.label.hasPrefix("local.Mac-TaskManager.")
-        }.map { service in
-            let path = service.programPath
-            return StartupItem(id: service.id, name: applicationName(path) ?? service.name,
-                publisher: publisher(path), path: path ?? service.plistPath, enabled: service.enabled,
-                source: service.identifier.domain == "system" ? "系统 LaunchDaemon" : "登录 LaunchAgent",
-                service: service.identifier, protectionReason: service.protectionReason)
-        }
+        var items = serviceItems(services, enrichMetadata: true)
         do { items += try legacyLoginItems() } catch { warnings.append(error.localizedDescription) }
         var background: [StartupItem] = []
         if let backgroundOutput {
@@ -55,10 +61,25 @@ enum StartupCatalog {
             !knownLabels.contains(item.backgroundIdentifier ?? "")
                 && !(item.path.map { knownPaths.contains(URL(fileURLWithPath: $0).standardizedFileURL.path) } ?? false)
         }
-        return (items, warnings)
+        // The legacy list can contain multiple bookmarks for the same application.
+        var seen = Set<String>()
+        return (items.filter { seen.insert($0.id).inserted }, warnings)
     }
 
-    static func parseBTM(_ text: String, uid: UInt32) -> [StartupItem] {
+    public static func serviceItems(_ services: [ServiceRecord], enrichMetadata: Bool = false) -> [StartupItem] {
+        services.filter {
+            $0.startsAutomatically && $0.plistPath?.hasPrefix("/System/") == false && !$0.identifier.label.hasPrefix("com.apple.")
+                && !$0.identifier.label.hasPrefix("local.Mac-TaskManager.")
+        }.map { service in
+            let path = service.programPath
+            return StartupItem(id: service.id, name: enrichMetadata ? applicationName(path) ?? service.name : service.name,
+                publisher: enrichMetadata ? publisher(path) : "—", path: path ?? service.plistPath, enabled: service.enabled,
+                source: service.identifier.domain == "system" ? "系统 LaunchDaemon" : "登录 LaunchAgent",
+                service: service.identifier, protectionReason: service.protectionReason)
+        }
+    }
+
+    public static func parseBTM(_ text: String, uid: UInt32) -> [StartupItem] {
         var currentUID: Int64?
         var fields: [String: String] = [:]
         var records: [(uid: Int64, fields: [String: String])] = []
@@ -113,18 +134,18 @@ enum StartupCatalog {
         return Dictionary(result.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }).map(\.value)
     }
 
-    static func legacyLoginItems() throws -> [StartupItem] {
+    public static func legacyLoginItems() throws -> [StartupItem] {
         guard let list = LSSharedFileListCreate(nil, kLSSharedFileListSessionLoginItems.takeUnretainedValue(), nil)?.takeRetainedValue(),
               let snapshot = LSSharedFileListCopySnapshot(list, nil)?.takeRetainedValue() as? [LSSharedFileListItem] else {
             throw ManagementFailure("无法读取传统登录项。")
         }
         var items: [StartupItem] = []
         for item in snapshot {
-            guard let url = LSSharedFileListItemCopyResolvedURL(item, 0, nil)?.takeRetainedValue() as URL? else { continue }
+            guard let url = LSSharedFileListItemCopyResolvedURL(item, UInt32(kLSSharedFileListNoUserInteraction | kLSSharedFileListDoNotMountVolumes), nil)?.takeRetainedValue() as URL? else { continue }
             items.append(StartupItem(id: "login:\(url.path)", name: applicationName(url.path) ?? url.deletingPathExtension().lastPathComponent,
                 publisher: publisher(url.path), path: url.path, enabled: true, source: "登录时打开", legacyURL: url))
         }
-        let disabled = UserDefaults.standard.stringArray(forKey: disabledLoginKey) ?? []
+        let disabled = preferences.stringArray(forKey: disabledLoginKey) ?? []
         let live = Set(items.map(\.id))
         for path in disabled where !live.contains("login:\(path)") {
             let url = URL(fileURLWithPath: path)
@@ -134,18 +155,18 @@ enum StartupCatalog {
         return items
     }
 
-    static func setLegacy(_ url: URL, enabled: Bool) throws {
+    public static func setLegacy(_ url: URL, enabled: Bool) throws {
         guard !enabled || FileManager.default.fileExists(atPath: url.path) else { throw ManagementFailure("登录项目标已不存在，请重新安装相关应用。") }
         guard let list = LSSharedFileListCreate(nil, kLSSharedFileListSessionLoginItems.takeUnretainedValue(), nil)?.takeRetainedValue() else {
             throw ManagementFailure("无法访问登录项列表。")
         }
-        let originalDisabled = UserDefaults.standard.stringArray(forKey: disabledLoginKey) ?? []
-        let originalHidden = UserDefaults.standard.dictionary(forKey: hiddenLoginKey) as? [String: Bool] ?? [:]
+        let originalDisabled = preferences.stringArray(forKey: disabledLoginKey) ?? []
+        let originalHidden = preferences.dictionary(forKey: hiddenLoginKey) as? [String: Bool] ?? [:]
         guard let snapshot = LSSharedFileListCopySnapshot(list, nil)?.takeRetainedValue() as? [LSSharedFileListItem] else {
             throw ManagementFailure("无法读取登录项，未更改启动设置。")
         }
         let current = snapshot.first { item in
-            (LSSharedFileListItemCopyResolvedURL(item, 0, nil)?.takeRetainedValue() as URL?) == url
+            (LSSharedFileListItemCopyResolvedURL(item, UInt32(kLSSharedFileListNoUserInteraction | kLSSharedFileListDoNotMountVolumes), nil)?.takeRetainedValue() as URL?) == url
         }
         guard enabled || current != nil else { throw ManagementFailure("登录项已经移除，请刷新后重试。") }
         var hidden = originalHidden
@@ -164,31 +185,35 @@ enum StartupCatalog {
         }
         var disabled = Set(originalDisabled)
         if enabled { disabled.remove(url.path) } else { disabled.insert(url.path) }
-        UserDefaults.standard.set(Array(disabled), forKey: disabledLoginKey)
-        UserDefaults.standard.set(hidden, forKey: hiddenLoginKey)
+        preferences.set(Array(disabled), forKey: disabledLoginKey)
+        preferences.set(hidden, forKey: hiddenLoginKey)
         do {
             let confirmed = try legacyLoginItems().first { $0.id == "login:\(url.path)" }
             guard confirmed?.enabled == enabled else { throw ManagementFailure("系统未确认登录项状态，请在系统设置中检查。") }
         } catch {
             if let inserted { _ = LSSharedFileListItemRemove(list, inserted) }
             if !enabled { _ = LSSharedFileListInsertItemURL(list, kLSSharedFileListItemLast.takeUnretainedValue(), nil, nil, url as CFURL, properties, nil) }
-            UserDefaults.standard.set(originalDisabled, forKey: disabledLoginKey)
-            UserDefaults.standard.set(originalHidden, forKey: hiddenLoginKey)
+            preferences.set(originalDisabled, forKey: disabledLoginKey)
+            preferences.set(originalHidden, forKey: hiddenLoginKey)
             throw error
         }
     }
 
-    static func enclosingApplication(_ path: String?) -> URL? {
-        guard let path else { return nil }
-        var url = URL(fileURLWithPath: path)
-        while url.path != "/" {
-            if url.pathExtension == "app" { return url }
-            url.deleteLastPathComponent()
+    public static func enclosingApplication(_ path: String?) -> URL? {
+        guard let path, path.hasPrefix("/") else { return nil }
+        // URL parent traversal can keep growing relative '..' paths on older Foundation versions.
+        var components: [Substring] = []
+        for part in path.split(separator: "/") {
+            if part == "." { continue }
+            if part == ".." {
+                if !components.isEmpty { components.removeLast() }
+            } else { components.append(part) }
         }
-        return nil
+        guard let index = components.lastIndex(where: { $0.hasSuffix(".app") && $0 != ".app" }) else { return nil }
+        return URL(fileURLWithPath: "/" + components[...index].joined(separator: "/"))
     }
 
-    static func applicationName(_ path: String?) -> String? {
+    public static func applicationName(_ path: String?) -> String? {
         guard let app = enclosingApplication(path), let bundle = Bundle(url: app) else { return nil }
         return bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
             ?? bundle.object(forInfoDictionaryKey: "CFBundleName") as? String
@@ -197,7 +222,7 @@ enum StartupCatalog {
 
     private static var publisherCache: [String: String] = [:]
     private static let publisherLock = NSLock()
-    static func publisher(_ path: String?) -> String {
+    public static func publisher(_ path: String?) -> String {
         guard let path else { return "—" }
         let url = enclosingApplication(path) ?? URL(fileURLWithPath: path)
         let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate?.timeIntervalSince1970 ?? 0
