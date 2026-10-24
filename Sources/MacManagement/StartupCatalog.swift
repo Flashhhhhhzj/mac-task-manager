@@ -200,15 +200,17 @@ public enum StartupCatalog {
     }
 
     public static func enclosingApplication(_ path: String?) -> URL? {
-        guard let path else { return nil }
-        var url = URL(fileURLWithPath: path)
-        while !url.path.isEmpty && url.path != "/" {
-            if url.pathExtension == "app" { return url }
-            let parent = url.deletingLastPathComponent()
-            guard parent.path != url.path else { return nil }
-            url = parent
+        guard let path, path.hasPrefix("/") else { return nil }
+        // URL parent traversal can keep growing relative '..' paths on older Foundation versions.
+        var components: [Substring] = []
+        for part in path.split(separator: "/") {
+            if part == "." { continue }
+            if part == ".." {
+                if !components.isEmpty { components.removeLast() }
+            } else { components.append(part) }
         }
-        return nil
+        guard let index = components.lastIndex(where: { $0.hasSuffix(".app") && $0 != ".app" }) else { return nil }
+        return URL(fileURLWithPath: "/" + components[...index].joined(separator: "/"))
     }
 
     public static func applicationName(_ path: String?) -> String? {
