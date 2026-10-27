@@ -1258,9 +1258,19 @@ final class ContentViewState: ObservableObject {
             AppRuntimePreferences.setLaunchAtLoginEnabled(launchAtLoginEnabled)
         }
     }
+    @Published var hideMainWindowAtLogin = AppRuntimePreferences.hidesMainWindowAtLogin {
+        didSet {
+            AppRuntimePreferences.setHidesMainWindowAtLogin(hideMainWindowAtLogin)
+        }
+    }
     @Published var keepRunningAfterWindowClose = AppRuntimePreferences.keepsRunningAfterWindowClose {
         didSet {
             AppRuntimePreferences.setKeepsRunningAfterWindowClose(keepRunningAfterWindowClose)
+        }
+    }
+    @Published var hideDockIcon = AppRuntimePreferences.hidesDockIcon {
+        didSet {
+            AppRuntimePreferences.setHidesDockIcon(hideDockIcon)
         }
     }
     @Published var coolModePolicy = CoolModePreferences.currentPolicy.rawValue {
@@ -2241,7 +2251,21 @@ struct RunningApplicationsPopover: View {
     private var columnHeader: some View {
         HStack(spacing: 0) {
             headerCell("名称", width: nameWidth, alignment: .leading, showsTrailingRule: false)
-            headerCell("", width: actionWidth, alignment: .center)
+            Button {
+                AppDelegate.shared?.showMainWindow()
+            } label: {
+                AppLogoImage()
+                    .frame(width: 24, height: 24)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("打开任务管理器")
+            .help("打开任务管理器主页面")
+            .frame(width: actionWidth, height: 36)
+            .overlay(alignment: .trailing) {
+                VerticalRule()
+            }
             headerCell("内存", width: memoryWidth, alignment: .center)
         }
         .frame(width: popoverWidth, alignment: .leading)
@@ -3277,6 +3301,24 @@ struct SettingsPage: View {
                 .zIndex(dropdownCoordinator.expandedIdentifier == "launch-at-login" ? 10 : 0)
 
                 SettingsOptionRow(
+                    icon: "macwindow",
+                    title: "开机自启后不唤起主页面",
+                    subtitle: "开机自启时仅在后台运行，手动打开应用仍显示主页面"
+                ) {
+                    SettingsDropdown(
+                        selection: Binding(
+                            get: { state.hideMainWindowAtLogin ? "开启" : "关闭" },
+                            set: { state.hideMainWindowAtLogin = $0 == "开启" }
+                        ),
+                        options: ["开启", "关闭"],
+                        identifier: "hide-main-window-at-login",
+                        dropdownCoordinator: dropdownCoordinator
+                    )
+                }
+                .padding(.bottom, 12)
+                .zIndex(dropdownCoordinator.expandedIdentifier == "hide-main-window-at-login" ? 10 : 0)
+
+                SettingsOptionRow(
                     icon: "rectangle.on.rectangle",
                     title: "关闭窗口后仍保持后台运行",
                     subtitle: "关闭最后一个窗口后保留状态栏图标并继续监控"
@@ -3293,6 +3335,24 @@ struct SettingsPage: View {
                 }
                 .padding(.bottom, 12)
                 .zIndex(dropdownCoordinator.expandedIdentifier == "keep-running-after-window-close" ? 10 : 0)
+
+                SettingsOptionRow(
+                    icon: "dock.rectangle",
+                    title: "关闭 Dock 栏图标",
+                    subtitle: "隐藏 Dock 中的应用图标，可从访达重新打开应用窗口"
+                ) {
+                    SettingsDropdown(
+                        selection: Binding(
+                            get: { state.hideDockIcon ? "开启" : "关闭" },
+                            set: { state.hideDockIcon = $0 == "开启" }
+                        ),
+                        options: ["开启", "关闭"],
+                        identifier: "hide-dock-icon",
+                        dropdownCoordinator: dropdownCoordinator
+                    )
+                }
+                .padding(.bottom, 12)
+                .zIndex(dropdownCoordinator.expandedIdentifier == "hide-dock-icon" ? 10 : 0)
 
                 SettingsSectionTitle("数据与日志")
                 SettingsOptionRow(
@@ -4248,7 +4308,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
+        // The login-item Apple event is only available during this callback.
+        let startsHidden = AppRuntimePreferences.shouldHideMainWindowOnLaunch(
+            event: NSAppleEventManager.shared().currentAppleEvent
+        )
+        if startsHidden {
+            NSApp.hide(nil)
+        }
         AppRuntimePreferences.applyLaunchAtLoginPreference()
         if let applicationIcon = AppArtwork.applicationIcon {
             NSApp.applicationIconImage = applicationIcon
@@ -4261,7 +4327,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // template status image only afterwards prevents the menu-bar
             // renderer from retaining the launch-time appearance snapshot.
             self.menuBarStatusController = MenuBarStatusController(monitor: self.monitor)
-            NSApp.activate(ignoringOtherApps: true)
+            AppRuntimePreferences.applyDockIconPreference()
+            if startsHidden {
+                self.mainWindow?.orderOut(nil)
+            } else {
+                NSApp.activate(ignoringOtherApps: true)
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             self?.menuBarStatusController?.reassertVisibility()
@@ -4282,12 +4353,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func showMainWindow() {
+        DispatchQueue.main.async {
+            self.menuBarStatusController?.closeDrawer()
+        }
         let targetWindow = mainWindow ?? NSApp.windows.first(where: { !($0 is NSPanel) })
         if let window = targetWindow {
             if mainWindow == nil {
                 mainWindow = window
                 window.delegate = self
             }
+            window.deminiaturize(nil)
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
         }

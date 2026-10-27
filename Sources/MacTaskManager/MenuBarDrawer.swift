@@ -133,6 +133,11 @@ final class MenuBarStatusController: NSObject {
         statusItem.isVisible = true
     }
 
+    func closeDrawer() {
+        guard panel.isVisible else { return }
+        slideDrawer(opening: false)
+    }
+
     func invalidate() {
         animationID = nil
         isOpen = false
